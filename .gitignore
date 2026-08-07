@@ -1,0 +1,32 @@
+# ---- Keil MDK 构建输出目录 ----
+MDK-ARM/BldcClamp/
+MDK-ARM/DebugConfig/
+
+# ---- 编译中间产物 ----
+*.o
+*.d
+*.crf
+*.lst
+*.lnp
+*.map
+*.htm
+*.axf
+*.hex
+*.bin
+*.dep
+*.i
+*.sct
+*.build_log.htm
+
+# ---- Keil 用户界面/会话配置（每个人不同，不入库）----
+*.uvguix.*
+*.uvoptx
+JLinkSettings.ini
+JLinkLog.txt
+
+# ---- 其他 ----
+.vscode/
+*.bak
+*.pdsc_bak_*
+Thumbs.db
+.DS_Store
