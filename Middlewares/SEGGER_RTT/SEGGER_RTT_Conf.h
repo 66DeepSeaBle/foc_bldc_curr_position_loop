@@ -92,7 +92,13 @@ Revision: $Rev: 24316 $
 #endif
 
 #ifndef   BUFFER_SIZE_UP
-  #define BUFFER_SIZE_UP                            (1024)  // Size of the buffer for terminal output of target, up to host (Default: 1k)
+  /* 原1024字节在本项目实测下经常被写爆：printf打印量大(每主循环周期
+     一行diagnostic + [STAT]/[HALL]附加打印)，叠加"挣脱过冲"诊断新加的
+     5ms密集打印窗口后，上行缓冲区常被写满，SEGGER_RTT_MODE_NO_BLOCK_SKIP
+     模式下写满就跳过/截断当前这次写入，表现为RTT终端里大段乱码/正常
+     文本中间插入无法识别的二进制片段。加大到4096给调试器更多余量，
+     芯片RAM本身用量很小(实测ZI-data仅约3.3KB)，加这点余量完全够用。 */
+  #define BUFFER_SIZE_UP                            (4096)  // Size of the buffer for terminal output of target, up to host (Default: 1k)
 #endif
 
 #ifndef   BUFFER_SIZE_DOWN

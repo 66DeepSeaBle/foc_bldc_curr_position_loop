@@ -400,6 +400,11 @@
               <FilePath>../Core/Src/main.c</FilePath>
             </File>
             <File>
+              <FileName>motion_guard.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/motion_guard.c</FilePath>
+            </File>
+            <File>
               <FileName>gpio.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/gpio.c</FilePath>
