@@ -10,7 +10,7 @@
       <TargetName>BldcClamp</TargetName>
       <ToolsetNumber>0x4</ToolsetNumber>
       <ToolsetName>ARM-ADS</ToolsetName>
-      <pCCUsed>5060750::V5.06 update 6 (build 750)::ARMCC</pCCUsed>
+      <pCCUsed>5060960::V5.06 update 7 (build 960)::.\ARMCC</pCCUsed>
       <uAC6>0</uAC6>
       <TargetOption>
         <TargetCommonOption>
@@ -137,7 +137,7 @@
             <DriverSelection>4101</DriverSelection>
           </Flash1>
           <bUseTDR>1</bUseTDR>
-          <Flash2>BIN\UL2V8M.DLL</Flash2>
+          <Flash2>BIN\UL2CM3.DLL</Flash2>
           <Flash3>"" ()</Flash3>
           <Flash4></Flash4>
           <pFcarmOut></pFcarmOut>
@@ -395,16 +395,6 @@
           <GroupName>Application/User/Core</GroupName>
           <Files>
             <File>
-              <FileName>main.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/main.c</FilePath>
-            </File>
-            <File>
-              <FileName>motion_guard.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/motion_guard.c</FilePath>
-            </File>
-            <File>
               <FileName>gpio.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/gpio.c</FilePath>
@@ -438,6 +428,51 @@
               <FileName>stm32g4xx_hal_msp.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32g4xx_hal_msp.c</FilePath>
+            </File>
+            <File>
+              <FileName>angle_observer.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\angle_observer.c</FilePath>
+            </File>
+            <File>
+              <FileName>current_loop.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\current_loop.c</FilePath>
+            </File>
+            <File>
+              <FileName>foc_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\foc_control.c</FilePath>
+            </File>
+            <File>
+              <FileName>main.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\main.c</FilePath>
+            </File>
+            <File>
+              <FileName>pid.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\pid.c</FilePath>
+            </File>
+            <File>
+              <FileName>position_loop.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\position_loop.c</FilePath>
+            </File>
+            <File>
+              <FileName>pwm_output.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\pwm_output.c</FilePath>
+            </File>
+            <File>
+              <FileName>speed_loop.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\speed_loop.c</FilePath>
+            </File>
+            <File>
+              <FileName>transform.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Core\Src\transform.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -595,5 +630,14 @@
     </components>
     <files/>
   </RTE>
+
+  <LayerInfo>
+    <Layers>
+      <Layer>
+        <LayName>BldcClamp</LayName>
+        <LayPrjMark>1</LayPrjMark>
+      </Layer>
+    </Layers>
+  </LayerInfo>
 
 </Project>
