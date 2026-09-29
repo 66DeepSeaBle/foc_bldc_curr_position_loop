@@ -32,7 +32,6 @@ void SpeedLoop_ResetInteg(SpeedLoop_t *loop);
 /* ---- ????IQ?? ---- */
 float SpeedLoop_GetIqCap(const SpeedLoop_t *loop);
 
-/* ---- ????: ????IQ?? (MotionGuard) ---- */
 void SpeedLoop_OverrideIqCap(SpeedLoop_t *loop, float cap);
 
 #endif

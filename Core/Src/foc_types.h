@@ -17,7 +17,8 @@ typedef enum {
     FOC_STATE_SPEED_LOOP,        // ??? + ???
     FOC_STATE_POSITION_LOOP,     // ??? + ??? + ???
     FOC_STATE_BRAKE,             // ??(????)
-    FOC_STATE_FAULT              // ??(???)
+    FOC_STATE_FAULT,             // ??(???)
+    FOC_STATE_OPENLOOP           // 开环速度测试(S): theta 自行旋转, 电流环钳 1A
 } FOC_State_t;
 
 /* ---- ???? ---- */
@@ -69,6 +70,13 @@ typedef struct {
     float elec_acc_deg;          // accumulated elec angle (multi-turn, from edges)
     uint8_t synced;              // 1 = hall synced (rotation detected)
     uint32_t glitch_cnt;         // glitch counter
+
+    /* 多边沿测速: 单边沿 omega=扇区宽/dt 每个电周期只有 6 个点, 转子摩擦爬行
+       ("冲一下、停一会")时会在几十~上千 eRPM 之间乱跳. 这里存最近 4 次边沿的
+       时刻与连续电角度, 用"总电角度/总时间"做平均测速. */
+    uint32_t edge_hist_tick[4];
+    float    edge_hist_acc[4];
+    uint8_t  edge_hist_idx;
 } Angle_Observer_t;
 
 /* ---- PID??? ---- */
@@ -152,6 +160,7 @@ typedef struct {
     float vref;                  // ADC???? (V)
     float shunt_r;               // ???? (O)
     float op_gain;               // ????
+    float deadtime_ns;           // 死区(ns). 0 = 关闭死区补偿(见 PWM_Output_Init)
     float current_scale;         // ??????
     float current_sign;          // ???? (??)
     float vbus_divider;          // ?????
@@ -161,6 +170,7 @@ typedef struct {
     float hall_offset_deg;       // ?????? (?)
     float overcurrent_amp;       // ???? (A)
     float align_current;         // ???? (A)
+    float startup_current;       // I-F 拖转电流 (A), 与 align 解耦(原来用 align*0.5)
     float startup_hz;            // I-F???? (Hz)
     float iq_ramp_rate;          // ?????? (A/s)
 } FOC_Config_t;

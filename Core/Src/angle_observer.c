@@ -62,6 +62,12 @@ void AngleObserver_Init(Angle_Observer_t *obs, float hall_offset_deg,
     obs->elec_acc_deg = 0.0f;
     obs->synced = 0;
     obs->glitch_cnt = 0;
+    /* 多边沿测速历史清零: 未填满时自动退回单边沿估计 */
+    for (int i = 0; i < 4; i++) {
+        obs->edge_hist_tick[i] = 0U;
+        obs->edge_hist_acc[i]  = 0.0f;
+    }
+    obs->edge_hist_idx = 0U;
 }
 
 /* ---- ????????? ---- */
@@ -110,8 +116,34 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
 
         obs->omega = (float)dir * sector_width / (float)dt;
 
-        /* 多圈电角度不再在这里按霍尔边沿累加: 改由 AngleObserver_GetTheta
-           用 theta 的逐拍增量做相位展开(见该函数里的注释). */
+        /* ---- 多边沿(窗口)测速 ----
+           单边沿 omega=扇区宽/dt 每个电周期只有 6 个点; 转子在静摩擦下"冲一下、
+           停一会"时, 冲的那次 dt 很小 → 单点估计冲到几百~上千 eRPM, 速度环看到
+           就满力矩反拉(积分被打到反向限幅), 然后要 ~1s 才退回来 → 转子停住等
+           积分爬回来, 再冲一次 = 一顿一顿(实测每步 2.3° 机械角、停 0.4~1.4s).
+           改用最近 3 个边沿(约 180° 电角度)的总电角度/总时间: 抖动按 1/3 降,
+           而且用连续电角度之差, 天然带方向, 不依赖 dir 判定. */
+        obs->edge_hist_tick[obs->edge_hist_idx] = now_tick;
+        obs->edge_hist_acc[obs->edge_hist_idx]  = obs->elec_acc_deg;
+        obs->edge_hist_idx = (uint8_t)((obs->edge_hist_idx + 1U) & 0x03U);
+        {
+            uint32_t t0 = obs->edge_hist_tick[obs->edge_hist_idx]; /* 最旧一条 */
+            float    a0 = obs->edge_hist_acc[obs->edge_hist_idx];
+            float    dacc = obs->elec_acc_deg - a0;
+            /* 只有 elec_acc_deg 确实在推进时才采用窗口估计。
+               ALIGN/STARTUP/手动开环期间 GetTheta 不被调用(FOC_DoAlign /
+               FOC_DoStartup 直接调 FOC_UpdateCurrent), 于是 elec_acc_deg 被冻结
+               → dacc==0 → omega 被算成 0 → omega_filt 衰减到 0 →
+               GetOmegaFiltErpm()==0 → STARTUP 的同步判据 |erpm|>8 永远不成立。
+               实测现象: 霍尔明明在跳(转子被拖动了), 却每次都
+               [STARTUP] Timeout, hall not synced → FAULT 0x0002。
+               此时保留上面的单边沿估计(扇区宽/dt)。 */
+            if (t0 != 0U && now_tick > t0 &&
+                (dacc > 0.01f || dacc < -0.01f)) {
+                obs->omega = dacc * 0.01745329f / (float)(now_tick - t0);
+            }
+            /* t0==0 → 历史还没填满(刚同步/刚交接), 保留上面的单边沿估计 */
+        }
 
         /* ---- ???? ---- */
         float omega_clamp = omega_clamp_erpm * 6.28318531f / 60.0f / pwm_freq;
@@ -237,6 +269,22 @@ float AngleObserver_GetMechDeg(const Angle_Observer_t *obs, float pole_pairs)
 {
     if (pole_pairs <= 0.0f) pole_pairs = 1.0f;
     return obs->elec_acc_deg / pole_pairs;
+}
+
+/* ---- 用对齐结果自动校正霍尔表零点 ----
+   对齐阶段 theta 被强制到 0°, 转子 d 轴就停在该电角度上; 读当时的霍尔状态 h0,
+   由 GetSectorCenter(h0) + offset ≡ 0 反解 offset(规整到 [0,2π)).
+   这样霍尔扇区表的零点偏差/接线差异会被自动吸收, 无需手调 hall_offset_deg. */
+void AngleObserver_CalibrateOffsetAtZero(Angle_Observer_t *obs, uint8_t hall_state)
+{
+    float c;
+    if (hall_state < 1U || hall_state > 6U) {
+        return;                     /* 无效扇区(0/7)不校正, 保留原 offset */
+    }
+    c = GetSectorCenter(hall_state, obs->hall_dir_rev);
+    obs->offset = -c;
+    while (obs->offset >= 6.28318531f) obs->offset -= 6.28318531f;
+    while (obs->offset < 0.0f)         obs->offset += 6.28318531f;
 }
 
 /* ---- ???? ---- */

@@ -32,7 +32,6 @@ float PositionLoop_Update(PositionLoop_t *loop,
 {
     float pos_err = target_deg - pos_now_deg;
     float speed_target;
-    float max_speed;
     uint32_t arrive_ticks;
 
     (void)dt_s;

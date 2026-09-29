@@ -183,6 +183,41 @@ static uint16_t adc1_inj_val[2];
 static uint16_t adc2_inj_val[1];
 static uint16_t adc_offset_u = 0, adc_offset_v = 0, adc_offset_w = 0;
 static uint8_t offset_calibrated = 0;
+static uint16_t g_vbus_raw = 0;
+
+/* ---- 开环速度测试参数 (S 键) ----
+   15Hz 电频率: 按 pp=26 算约 35rpm, 按 pp=4 算约 225rpm —— 两种都可能,
+   但都能看出转子在不在转. 合成电流 1A(约 1/4 额定), 10s 后自动停. */
+#define OL_TEST_HZ    15.0f
+#define OL_TEST_AMP    1.0f
+#define OL_TEST_MS  10000U
+
+/* ---- 母线电压采集 ----
+   ADC1 规则通道 IN1 上挂了分压网络(config.vbus_divider=13.4), MX_ADC1_Init 里
+   配置了规则转换、HAL_ADC_Start 也调了, 但**从来没有读过 DR** —— 于是"母线到底
+   几伏"一直是盲区, 而这恰恰是解释下面这个矛盾唯一的未知量:
+
+     日志里 vd/vq 到 ±0.45(≈11V@24V母线), 而相电流只有 2~3A  → 隐含阻抗 ~4Ω;
+     但 ALIGN 刚开通那一拍 |v|=0.10(≈2.5V) 却读到 12A → 隐含阻抗 ~0.2Ω.
+     同一台机器、同一秒内, 等效阻抗差 20 倍 → 只能是母线在负载下塌了
+     (电源被限流 / 供电线压降), 因为"占空比×母线电压"才是真实施加电压.
+
+   注意: ADC1 已被注入通道(相电流)占用, HAL_ADC_Start() 此时返回 HAL_BUSY 且
+   不触发转换, 所以这里直接写 ADSTART 位做一次软件触发规则转换. 注入通道结果
+   在 JDRx, 规则通道结果在 DR, 互不干扰. */
+static float Vbus_ReadVolts(void)
+{
+    uint32_t guard = 0;
+
+    ADC1->ISR = ADC_ISR_EOC;            /* 清掉可能残留的 EOC(免读到旧值) */
+    ADC1->CR |= ADC_CR_ADSTART;         /* 软件触发一次规则转换 */
+    while ((ADC1->ISR & ADC_ISR_EOC) == 0U) {
+        if (++guard > 200000U) return -1.0f;   /* 超时: 返回负值, 便于识别 */
+    }
+    g_vbus_raw = (uint16_t)ADC1->DR;    /* 读 DR 会清 EOC */
+    return (float)g_vbus_raw * g_foc.config.vref / 4095.0f *
+           g_foc.config.vbus_divider;
+}
 
 /**
   * @brief  ADC??????????
@@ -190,12 +225,13 @@ static uint8_t offset_calibrated = 0;
   */
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-    const float ADC_VREF = 3.3f;
-    const uint16_t ADC_RESOLUTION = 4096;
-    const float R_SHUNT = 0.01f;
-    const float OP_GAIN = 8.0f;
-    const float CURRENT_SCALE = R_SHUNT * OP_GAIN;
-    const float CURRENT_SIGN = -1.0f;
+    /* 电流量纲单一来源: 统一取 foc 配置, 避免这里和 config 各写一份
+       (原来这里硬编码 R_SHUNT=0.01/OP_GAIN=8, 与 config.shunt_r/op_gain
+        重复; 一旦要按实际硬件改标定值, 漏改一处就会对不上) */
+    const float CURRENT_SCALE = g_foc.config.shunt_r * g_foc.config.op_gain;
+    const float ADC_VREF = g_foc.config.vref;
+    const float ADC_RESOLUTION = (float)g_foc.config.adc_resolution;
+    const float CURRENT_SIGN = g_foc.config.current_sign;
     float i_u, i_v;
 
     if (hadc->Instance == ADC1) {
@@ -296,15 +332,15 @@ static void HallVerify_Enter(void)
     g_hv.total_deg = 0.0f;
     g_hv.last_live = 0;
 
-    LOGI("\r\n[HALL] ==== Manual hall-spin verify ====\r\n");
-    LOGI("[HALL] Drive disabled. Spin the rotor slowly & evenly by hand.\r\n");
-    LOGI("[HALL] Watch st=1..6 sequence and U V W; no 0/7 expected.\r\n");
-    LOGI("[HALL] elec = angle, current code convention (deg, 0..360)\r\n");
-    LOGI("[HALL] rev  = mirrored angle if hall order were reversed\r\n");
-    LOGI("[HALL] If spinning the intended-forward way makes elec go DOWN\r\n");
-    LOGI("[HALL] (while rev goes UP), hall order is REVERSED -> flip\r\n");
-    LOGI("[HALL] config.hall_dir_rev (0<->1) in main.c, then rebuild.\r\n");
-    LOGI("[HALL] Press 'q' to exit/re-align.\r\n");
+    LOGD("\r\n[HALL] ==== Manual hall-spin verify (drive DISABLED) ====\r\n");
+    LOGD("[HALL] Spin the rotor slowly & evenly by hand.\r\n");
+    LOGD("[HALL] Watch st=1..6 sequence and U V W; no 0/7 expected.\r\n");
+    LOGD("[HALL] elec = angle, current code convention (deg, 0..360)\r\n");
+    LOGD("[HALL] rev  = mirrored angle if hall order were reversed\r\n");
+    LOGD("[HALL] total = accumulated elec deg; spin EXACTLY one turn and\r\n");
+    LOGD("[HALL]         pole_pairs = (fwd+bwd)/6  -> set config.pole_pairs\r\n");
+    LOGD("[HALL] bad should stay 0 (0/7 or skipped sector = wiring/order).\r\n");
+    LOGD("[HALL] ONLY 'q' works in this mode -> press 'q' to exit/re-align.\r\n");
 }
 
 static void HallVerify_Exit(void)
@@ -313,7 +349,7 @@ static void HallVerify_Exit(void)
     g_foc.flags.fault   = 0;
     g_foc.flags.enabled = 1;
     FOC_Control_SetState(&g_foc, FOC_STATE_ALIGN);
-    LOGI("[HALL] Verify exit -> ALIGN again.\r\n");
+    LOGD("[HALL] Verify exit -> ALIGN again.\r\n");
 }
 
 static void HallVerify_Poll(uint32_t now)
@@ -341,7 +377,7 @@ static void HallVerify_Poll(uint32_t now)
         g_hv.t_cnt++;
         if (st == 0 || st == 7 || p == 0 || p == 7) {
             g_hv.bad_cnt++;
-            LOGI("[HALL] #%u U%uV%uW%u st=%u  BAD(0/7)\r\n",
+            LOGD("[HALL] #%u U%uV%uW%u st=%u  BAD(0/7)\r\n",
                  g_hv.t_cnt, ru, rv, rw, st);
         } else if (st == H_FWD[p]) {
             g_hv.fwd_cnt++;
@@ -364,7 +400,7 @@ static void HallVerify_Poll(uint32_t now)
     /* 周期实时行 */
     if ((now - g_hv.last_live) >= 250) {
         g_hv.last_live = now;
-        LOGI("[HALL] U%uV%uW%u st=%u syn=%d elec=%.1f rev=%.1f fwd=%u bwd=%u bad=%u total=%.0fdeg\r\n",
+        LOGD("[HALL] U%uV%uW%u st=%u syn=%d elec=%.1f rev=%.1f fwd=%u bwd=%u bad=%u total=%.0fdeg\r\n",
              ru, rv, rw, st, (int)g_foc.angle.synced, elec, rev,
              g_hv.fwd_cnt, g_hv.bwd_cnt, g_hv.bad_cnt, g_hv.total_deg);
     }
@@ -374,6 +410,8 @@ int main(void)
 {
     FOC_Config_t config;
     uint32_t last_print = 0;
+    uint32_t last_adc_print = 0;
+    uint32_t last_ol_print = 0;
 
     HAL_Init();
     SystemClock_Config();
@@ -395,25 +433,45 @@ int main(void)
     LOGD("\r\n===== FOC Control System =====\r\n");
     LOGD("MCU: STM32G431RBT6, 170MHz\r\n");
     LOGD("PWM: 20kHz Center-Aligned\r\n");
-    LOGD("[FW] build 2026-09-12 spd-decay ref-scale\r\n");
+    LOGD("[FW] build 2026-09-27 manual-ol4 oc-guard\r\n");
 
     /* ---- ??FOC ---- */
     config.pwm_freq = 20000.0f;
     config.vref = 3.3f;
     config.shunt_r = 0.01f;
     config.op_gain = 8.0f;
+    /* 死区补偿 = 正反馈陷阱, 实测必须关掉:
+       PWM_Output_SVPWM 里按每相电流符号给 ±dt_comp(0.02 duty) 修正, 本意是
+       补偿死区压降。但它是拿"测到的电流"当输入 → 一旦电流读数有偏差就会
+       在两相之间造出一个真实电压差 → 又反过来维持那个读数(正反馈)。
+       实锤: OL 测试段0 命令 v=0(三相同占空比 = 绕组短接, 本该 0A), 日志却是
+       `du=0.520 dv=0.520 dw=0.480`(不对称!) 且 |I| 从 8.75A 涨到 17.9A。
+       0.02 duty 只有 0.39V 量级, 去掉它损失很小, 先排除这个疑点。 */
+    config.deadtime_ns = 0.0f;
     config.current_scale = 0.01f * 8.0f;
     config.current_sign = -1.0f;
-    config.vbus_divider = 13.4f;
+    /* 母线分压比: 用户用万用表实测驱动器母线端子 = 24V, 而 divider=13.4 时
+       固件算出来只有 19.5V(即 raw≈1804 → 1.454V)。要得到 24V:
+         1.454V * 16.5 = 24.0V  → 分压比应为 16.5(原来是 13.4, 算小了 23%)。
+       这个常数直接影响所有 "占空比 x 母线" 的电压换算, 所以必须对。 */
+    config.vbus_divider = 16.5f;
     config.adc_resolution = 4096;
-    config.pole_pairs = 26;
+    /* 实测电机参数(用户提供): 4 对极, 相电阻 0.52Ω, 相电感 0.31mH.
+       原来写 26 对极是错的, 会直接影响 GetMechDeg / 位置环 / I-F 起始频率的换算. */
+    config.pole_pairs = 4;
     /* 霍尔方向: 实测(逐组切换验证) 只有 dir_rev=1 + torque_dir=-1 一组
        能“不振动、稳定停住”，其余组合要么剧烈振动要么跑飞，故默认 1.
        运行时可用 'd' 键翻转(会与 torque_dir 组合成另一类符号). */
     config.hall_dir_rev = 1;
     config.hall_offset_deg = 0.0f;
     config.overcurrent_amp = 6.0f;
+    /* 对齐电流: 实测 2.0A 已能可靠把转子拉到 0°(42BLH90 齿槽转矩不大), 
+       不必用 3.0A(减少发热与对功率级的压力). I-F 拖转另用 startup_current. */
     config.align_current = 2.0f;
+    /* I-F 拖转电流: 原来用 align_current*0.5=1.0A, 实测只把转子拖到 ~13eRPM
+       就滑脱、6s 超时进 FAULT(42BLH90 齿槽转矩较大). 提到 3.0A 后能拖动;
+       现取 2.5A 留出对 6A 过流门限与 4A 额定电流的余量. */
+    config.startup_current = 2.5f;
     config.startup_hz = 6.0f;
     config.iq_ramp_rate = 2.0f;
 
@@ -475,31 +533,41 @@ int main(void)
        (不加电), 或按 's' 立即开始; 超时则自动 ALIGN->STARTUP */
     g_foc.flags.enabled = 0;
     FOC_Control_SetState(&g_foc, FOC_STATE_IDLE);
-    LOGD("[MAIN] FOC ready (IDLE). dir_rev=%d torque_dir=%d. 'c'=manual hall verify, 's'=start now\r\n",
+    LOGD("[MAIN] FOC ready (IDLE). dir_rev=%d torque_dir=%d. 's'=open-loop test  'c'=manual hall verify\r\n",
          (int)g_foc.config.hall_dir_rev, (int)g_foc.torque_dir);
-    LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  d=flip dir  t=flip torque\r\n");
-    LOGD("[MAIN] Keys: z=target 0  0~9=target digit*45deg\r\n");
+    LOGD("[MAIN] Keys: o=MANUAL  u/i=V+/-0.01  n/m=V+/-0.05  h/l=freq +/-1Hz  f=dir  t=stop\r\n");
+    LOGD("[MAIN] Keys: s=auto V/f test  p=PWM smoke test  r=re-align  d=dir_rev  y=torque\r\n");
+    LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  z=target 0  0~9=digit*45deg  c=hall verify\r\n");
     LOGD("[ANG] idx,state,hall,synced,elec_deg,mech_deg,erpm\r\n");
     (void)g_log_seq;    /* [ANG] 已降为 LOGI(默认不打印), 序号不再被引用 */
 
     {
         uint32_t boot_wait = HAL_GetTick();
-        uint8_t  start_now = 0;
-        while (!hall_verify_mode && !start_now &&
+        uint8_t  start_ol  = 0;
+        while (!hall_verify_mode && !start_ol &&
                (HAL_GetTick() - boot_wait) < 5000U) {
             int ch;
             while ((ch = SEGGER_RTT_GetKey()) >= 0) {
                 if (ch == 'c' || ch == 'C') HallVerify_Enter();
-                else if (ch == 's' || ch == 'S') start_now = 1;
+                else if (ch == 's' || ch == 'S') start_ol = 1;
             }
             HAL_Delay(10);
         }
+
+        /* 's': 直接进开环速度测试(1A / 15Hz 电频 / 10s 后自动停), 不进闭环 */
+        if (start_ol) {
+            FOC_Control_StartOpenLoopTest(&g_foc, OL_TEST_HZ, OL_TEST_AMP,
+                                          OL_TEST_MS);
+        }
     }
 
-    if (!hall_verify_mode) {
-        g_foc.flags.enabled = 1;
-        FOC_Control_SetState(&g_foc, FOC_STATE_ALIGN);
-        LOGD("[MAIN] FOC started, state=ALIGN\r\n");
+    /* 开机**不再自动进 ALIGN**。
+       原因: 板子在维修/排查阶段, 一上电就自动驱动桥臂, 会把带故障的半桥
+       (实测 W 相下管击穿)一直烧着, 几十秒就 70~80°C。改成必须手动按键才启动:
+         's' = 自动 V/f 测试   'o' = 手动开环(配万用表)   'p' = PWM 硬烟测
+       这样上电后桥臂是关的, 可以安全地做断电/上电的电压测量。 */
+    if (!hall_verify_mode && !g_foc.ol_active) {
+        LOGD("[MAIN] IDLE - NOT auto-started. press 'o'(manual) / 's'(auto V/f) / 'p'(pwm test)\r\n");
     }
 
     /* ---- ???: ??????? ---- */
@@ -521,20 +589,62 @@ int main(void)
                     g_foc.config.hall_dir_rev = g_foc.angle.hall_dir_rev;
                     LOGD("[CMD] dir_rev -> %d (torque=%d)\n",
                          (int)g_foc.angle.hall_dir_rev, (int)g_foc.torque_dir);
+                } else if (ch == 's' || ch == 'S') {
+                    /* 开环速度测试(与开机 5s 内按 s 同一个动作) */
+                    FOC_Control_StartOpenLoopTest(&g_foc, OL_TEST_HZ, OL_TEST_AMP,
+                                                  OL_TEST_MS);
                 } else if (ch == 't' || ch == 'T') {
+                    /* 停止开环测试(T 键专门用于测试; torque 翻转移到 y) */
+                    if (g_foc.ol_active) {
+                        FOC_Control_StopOpenLoopTest(&g_foc, "key T");
+                    } else {
+                        LOGD("[CMD] no open-loop test running\n");
+                    }
+                } else if (ch == 'y' || ch == 'Y') {
                     /* 运行时翻转力矩方向(torque_dir) */
                     g_foc.torque_dir = (int8_t)-g_foc.torque_dir;
                     LOGD("[CMD] torque_dir -> %d (dir=%d)\n",
                          (int)g_foc.torque_dir, (int)g_foc.angle.hall_dir_rev);
+                } else if (ch == 'o' || ch == 'O') {
+                    /* 手动开环: 电压/频率靠按键一步步加, 配合万用表自检 */
+                    FOC_Control_StartManualTest(&g_foc);
+                } else if (ch == 'u' || ch == 'U') {
+                    FOC_Control_ManualAdjust(&g_foc, +0.01f, 0.0f);
+                } else if (ch == 'i' || ch == 'I') {
+                    FOC_Control_ManualAdjust(&g_foc, -0.01f, 0.0f);
+                } else if (ch == 'n' || ch == 'N') {
+                    FOC_Control_ManualAdjust(&g_foc, +0.05f, 0.0f);
+                } else if (ch == 'm' || ch == 'M') {
+                    FOC_Control_ManualAdjust(&g_foc, -0.05f, 0.0f);
+                } else if (ch == 'h' || ch == 'H') {
+                    FOC_Control_ManualAdjust(&g_foc, 0.0f, +1.0f);
+                } else if (ch == 'l' || ch == 'L') {
+                    FOC_Control_ManualAdjust(&g_foc, 0.0f, -1.0f);
+                } else if (ch == 'p' || ch == 'P') {
+                    /* 硬件烟测: 三相 50% 占空比, 不旋转, 按 t 停 */
+                    FOC_Control_StartPwmSmokeTest(&g_foc);
+                } else if (ch == 'f' || ch == 'F') {
+                    /* 开环测试旋转方向翻转 */
+                    FOC_Control_FlipOpenLoopDir(&g_foc);
+                } else if (ch == 'r' || ch == 'R') {
+                    /* 清故障并重新对齐: 之前一进 FAULT(st=7) 就只能断电重启,
+                       ALIGN/STARTUP 失败后按任何数字键都没反应就是卡在这里. */
+                    g_foc.flags.fault   = 0;
+                    g_foc.fault_code    = 0;
+                    g_foc.flags.enabled = 1;
+                    g_foc.align_tick    = 0;   /* 让 DoAlign 重新计时 */
+                    g_foc.startup_tick  = 0;
+                    FOC_Control_SetState(&g_foc, FOC_STATE_ALIGN);
+                    LOGD("[CMD] fault cleared -> ALIGN\n");
                 } else if (ch == 'z' || ch == 'Z') {
                     FOC_Control_SetPosTarget(&g_foc, 0.0f);
                     LOGD("[CMD] Zero position\n");
                 } else if (ch == 'j' || ch == 'J') {
                     /* 开环力矩探针: +Iq 脉冲, 测机械方向 */
-                    FOC_Control_SetTorqueProbe(&g_foc, +0.7f, 500);
+                    FOC_Control_SetTorqueProbe(&g_foc, +2.5f, 600);
                 } else if (ch == 'k' || ch == 'K') {
                     /* 开环力矩探针: -Iq 脉冲, 测机械方向 */
-                    FOC_Control_SetTorqueProbe(&g_foc, -0.7f, 500);
+                    FOC_Control_SetTorqueProbe(&g_foc, -2.5f, 600);
                 } else if (ch >= '0' && ch <= '9') {
                     /* ????:????????? */
                     float target = (float)(ch - '0') * 45.0f;
@@ -542,6 +652,69 @@ int main(void)
                     LOGD("[CMD] Set target %.1fdeg\n", target);
                 }
             }
+        }
+
+        /* ---- ADC 原始值诊断(1s 一条) ----
+           核对电流采样量纲: I = -(cnt-offset)*Vref/(4095)/(shunt_r*op_gain).
+           例: 若 cnt 只比 offset 高 ~100 而代码显示 1.5A, 说明 shunt_r 写小了
+           (实际电阻更小/没有外部分流), 实际电流远小于显示值 → 空载也不转. */
+        if ((now - last_adc_print) >= 1000U) {
+            float vbus_v = Vbus_ReadVolts();
+            last_adc_print = now;
+            if (vbus_v >= 0.0f) g_foc.current.vbus = vbus_v;
+            LOGD("[ADCR] vbraw=%u vb=%.1fV | cntU=%u cntV=%u cntW=%u | offU=%u offV=%u offW=%u | Iu=%.2f Iv=%.2f Iw=%.2f | shunt=%.4f gain=%.1f\r\n",
+                 g_vbus_raw, vbus_v,
+                 adc1_inj_val[0], adc2_inj_val[0], adc1_inj_val[1],
+                 adc_offset_u, adc_offset_v, adc_offset_w,
+                 g_foc.current.u, g_foc.current.v, g_foc.current.w,
+                 g_foc.config.shunt_r, g_foc.config.op_gain);
+
+            /* 负载下母线塌陷是"电流环顶到限幅也拉不到目标电流"的头号嫌疑,
+               单独用 WARN 打一条, 免得淹没在 [ADCR] 里. */
+            if (vbus_v >= 0.0f && vbus_v < 8.0f &&
+                g_foc.state != FOC_STATE_IDLE) {
+                LOGW("[VBUS] LOW %.1fV while driving (raw=%u) - supply current-limit / sag?!\r\n",
+                     vbus_v, g_vbus_raw);
+            }
+        }
+
+        /* ---- 手动开环日志(200ms 一条) ---- */
+        if (g_foc.ol_active && g_foc.ol_manual && (now - last_ol_print) >= 200U) {
+            last_ol_print = now;
+            LOGD("[MAN] st=%d v=%.4f Vll=%.2fV f=%.1fHz dir=%+d th=%6.1f | |I|=%.2f (Iu=%+.2f Iv=%+.2f Iw=%+.2f) raw=%u/%u/%u | du=%.3f dv=%.3f dw=%.3f | vb=%.1fV\r\n",
+                 (int)g_foc.state,
+                 g_foc.ol_man_v,
+                 1.7320508f * g_foc.ol_man_v * g_foc.current.vbus,
+                 g_foc.ol_man_hz, (int)g_foc.ol_dir,
+                 g_foc.ol_theta * 57.29577951f,
+                 g_foc.ol_i_meas,
+                 g_foc.current.u, g_foc.current.v, g_foc.current.w,
+                 adc1_inj_val[0], adc2_inj_val[0], adc1_inj_val[1],
+                 PWM_Output_GetDu(&g_foc.pwm),
+                 PWM_Output_GetDv(&g_foc.pwm),
+                 PWM_Output_GetDw(&g_foc.pwm),
+                 g_foc.current.vbus);
+        }
+
+        /* ---- 自动开环测试日志(200ms 一条) ----
+           段0(ph=0/1/2)看 V/I, 算 R_eq; 段1(ph=3)看电机是否转。
+           `Vll` = 命令的线电压, 段0 稳压时拿万用表量任意两相引出线,
+           读数应该接近 Vll —— 若差很多倍, 说明电压根本没加到电机上。 */
+        if (g_foc.ol_active && !g_foc.ol_manual && (now - last_ol_print) >= 200U) {
+            last_ol_print = now;
+            LOGD("[OL] t=%.2fs ph=%d dir=%+d th=%6.1f v=%.4f Vll=%.2fV | |I|=%.2f (Iu=%+.2f Iv=%+.2f Iw=%+.2f) raw=%u/%u/%u | du=%.3f dv=%.3f dw=%.3f | vb=%.1fV\r\n",
+                 (float)g_foc.ol_tick / g_foc.config.pwm_freq,
+                 (int)g_foc.ol_phase, (int)g_foc.ol_dir,
+                 g_foc.ol_theta * 57.29577951f,
+                 g_foc.ol_v_amp,
+                 1.7320508f * g_foc.ol_v_amp * g_foc.current.vbus,
+                 g_foc.ol_i_meas,
+                 g_foc.current.u, g_foc.current.v, g_foc.current.w,
+                 adc1_inj_val[0], adc2_inj_val[0], adc1_inj_val[1],
+                 PWM_Output_GetDu(&g_foc.pwm),
+                 PWM_Output_GetDv(&g_foc.pwm),
+                 PWM_Output_GetDw(&g_foc.pwm),
+                 g_foc.current.vbus);
         }
 
         /* 手动盘轴验证: 高频采样(2ms), 不打常规状态行 */
@@ -557,8 +730,8 @@ int main(void)
                     g_foc.position_loop.arrive_tol_deg) ? 100U : 500U;
         if ((now - last_print) >= print_ms) {
             last_print = now;
-            LOGD("[MAIN] st=%d flt=%d h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f I=%.2f\r\n",
-                 g_foc.state, g_foc.flags.fault,
+            LOGD("[MAIN] st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f I=%.2f\r\n",
+                 g_foc.state, g_foc.flags.fault, g_foc.fault_code,
                  (int)g_foc.hall.state,
                  (int)g_foc.position_loop.arrived,
                  AngleObserver_GetMechDeg(&g_foc.angle, g_foc.config.pole_pairs),
