@@ -20,7 +20,7 @@ static uint8_t motor_pwm_off_logged = 0;
 
 /* 固件版本标签: 开机打一次, 并**每秒跟着 [ADCR] 打一次** —— 这样即使用户
    只截取日志中段, 也能一眼看出跑的是哪个版本(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-11o adv-writeback"
+#define FW_BUILD_TAG  "2026-10-11ac extdecay-5ms"
 
 /* ---- ????????? (RTT) ---- */
 #define ANGLE_LOG_MS   10U          /* 角度采样打印周期 (ms) */
@@ -825,7 +825,7 @@ int main(void)
         }
         if ((now - last_print) >= print_ms) {
             last_print = now;
-            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f\r\n",
+            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f | mv=%d jp=%u vs=%.0f | hl=%d gv=%d bh=%d cr=%u\r\n",
                  (unsigned long)now,
                  g_foc.state, g_foc.flags.fault, g_foc.fault_code,
                  (int)g_foc.hall.state,
@@ -851,7 +851,16 @@ int main(void)
                  FOC_Control_GetVelPosErpm(),
                  g_foc.angle.adv * 57.29577951f,
                  (float)(g_foc.tick - g_foc.hall.edge_tick) /
-                     (g_foc.config.pwm_freq / 1000.0f));
+                     (g_foc.config.pwm_freq / 1000.0f),
+                 (int)FOC_Control_GetPosMove(),
+                 (unsigned)FOC_Control_GetPosJumpCnt(),
+                 FOC_Control_GetVelWinErpm(),
+                 /* ★★ 2026-10-11aa: 三个静默锁 + 爬行失败数(l=到位死区,
+                    g=爬行认输, b=机构推不动, cr=本轮连续推不动次数) */
+                 (int)FOC_Control_GetPosHoldFlag(),
+                 (int)FOC_Control_GetPosGiveFlag(),
+                 (int)FOC_Control_GetPosBlockFlag(),
+                 (unsigned)FOC_Control_GetPosHopCnt());
         }
 
         /* ??RTT????????: ???? + ???? */

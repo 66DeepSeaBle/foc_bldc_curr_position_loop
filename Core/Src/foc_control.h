@@ -107,6 +107,18 @@ float FOC_Control_GetPosIntegA(void);
 float FOC_Control_GetPosErpm(void);
 /* 2026-10-11o 诊断: 位置差分那一路的原始测速(eRPM) */
 float FOC_Control_GetVelPosErpm(void);
+/* 2026-10-11r 诊断: 1 = 50ms 窗判定"真的在动"; 0 = 判定已停(速度被当 0) */
+uint8_t FOC_Control_GetPosMove(void);
+/* 2026-10-11r 诊断: 位置读数被判为"跳变"而丢弃的次数 */
+uint16_t FOC_Control_GetPosJumpCnt(void);
+/* 2026-10-11r 诊断: 50ms 窗口净位移测速(eRPM, 唯一可信的一路) */
+float FOC_Control_GetVelWinErpm(void);
+
+/* ★★ 2026-10-11aa 诊断: 三个"静默锁"(1 = 锁住) + 爬行失败计数 */
+uint8_t  FOC_Control_GetPosHoldFlag(void);
+uint8_t  FOC_Control_GetPosGiveFlag(void);
+uint8_t  FOC_Control_GetPosBlockFlag(void);
+uint16_t FOC_Control_GetPosHopCnt(void);
 void FOC_Control_SetSpeedRef(FOC_Control_t *foc, float ref_erpm);
 void FOC_Control_SetIqRef(FOC_Control_t *foc, float iq_ref);
 void FOC_Control_SetTorqueProbe(FOC_Control_t *foc, float iq_A, uint32_t dur_ms);

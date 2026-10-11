@@ -85,7 +85,13 @@ typedef struct {
        ALIGN/STARTUP 期间 GetTheta 不被调用 ⇒ elec_acc_deg 冻结 ⇒ 窗口测速
        没意义(必须退回单边沿估计, 否则 STARTUP 同步判据永远不成立)。 */
     uint32_t last_get_tick;
-
+    /* ★★ 2026-10-11ac 边沿间**外推速度**(rad/tick) —— 与 omega_filt 分开:
+       omega_filt 是"上报给环路看"的模型速度; pos_ext_w 只用来推进 adv,
+       并在每条边沿重载实测值、之后按 POS_MODEL_TAU_S **累积**衰减键
+     (不分开的话衰减会被 omega_filt 的写回顺序吃掉 ⇒ 停转后读数会一直爬到
+       扇区钳位, 凭空造出一个"差一个齿槽"的假误差 —— 10-11aa 日志实测)。 */
+    float    pos_ext_w;
+    uint32_t pos_ext_tick;
     /* ---- 2026-10-11c: 位置改成"扇区序号 + 扇区内插值"的绝对算法 ----
        sect_run   : 沿正向环序累计走过的扇区数(整型, 只在边沿更新, 不会漂)
        pos_abs_rad: 当前绝对电角度 = 360°×圈数 + 扇区入口角 + 扇区内进角
