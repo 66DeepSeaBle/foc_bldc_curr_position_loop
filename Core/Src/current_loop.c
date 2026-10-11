@@ -41,6 +41,13 @@ void CurrentLoop_SetIqRef(CurrentLoop_t *loop, float iq_ref)
     loop->iq_ref = iq_ref;
 }
 
+void CurrentLoop_SetQInteg(CurrentLoop_t *loop, float integ_duty)
+{
+    if (integ_duty >  loop->vlim) integ_duty =  loop->vlim;
+    if (integ_duty < -loop->vlim) integ_duty = -loop->vlim;
+    loop->pid_q.integ = integ_duty;
+}
+
 float CurrentLoop_GetVd(const CurrentLoop_t *loop)
 {
     return loop->vd;

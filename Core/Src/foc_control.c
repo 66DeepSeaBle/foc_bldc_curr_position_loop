@@ -101,6 +101,7 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
     foc->fault_code = 0;
 
     foc->pos_target_deg_cmd = 0.0f;
+    foc->pos_target_user_set = 0U;
     foc->speed_ref_erpm_cmd = 0.0f;
     foc->iq_ref_cmd = 0.0f;
 
@@ -146,17 +147,29 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
        完全不动、超调后也刹不住, 说明力矩裕量不足; 过流保护在 6A, align 已用
        2A, 3.5A 有裕量(注意堵转会发热, 调试用可以, 长期要回落).
        稳定后(转速误差连续 200ms 小于 10eRPM)回落到 iq_max_normal=1.5A 保持. */
-    SpeedLoop_Init(&foc->speed_loop, 0.008f, 0.05f,
-                   1.5f, 3.5f, 10.0f, 200U, 2000.0f);
+    SpeedLoop_Init(&foc->speed_loop, 0.004f, 0.02f,
+                   0.5f, 1.2f, 10.0f, 200U, 1000.0f);
 
     /* ??????
        kp=0.3 eRPM/deg 太小: 45° 误差只给 13.5 eRPM(≈2.5°/s), 而霍尔瞬时速度
        是几百~上千 eRPM, 差 100 倍以上 → 速度环永远处于 bang-bang.
        提到 4.0: 45° → 180 eRPM(≈42°/s, 约 1.1s 到位), 与实际速度同量级;
        decel 150→2000 让 √(2*a*dist) 限速曲线不再一上来就把指令压死. */
-    PositionLoop_Init(&foc->position_loop, 4.0f,
-                      2000.0f, 2000.0f,
-                      3.0f, 500U,
+    /* 2026-09-30 大降增益(实测硬件修好、方向改对后出现的"剧烈来回摆"):
+       现象: 目标 0°、位置在 -90°~+105° 之间以 ~5Hz 大幅摆动, Iqref 在
+       ±3.5A 之间翻, 机构明显在两端硬限位上撞。
+       原因: ①位置反馈只有 6 步/电周期(霍尔扇区 ≈15° 机械阶梯)且带滞后,
+             ②速度反馈来自多边沿窗口 + 100ms 低通, 相位滞后很大,
+             ③位置环 kp=4.0(eRPM/deg) + 速度环 iq_cap=3.5A ⇒ 环路增益远
+               高于反馈能支撑的带宽 ⇒ 饱和式 limit cycle(一冲一撞)。
+       修改: kp 4.0→1.0, 限速 2000→300eRPM(≈75rpm 机械, 温和),
+             decel 2000→400, 到位容差 3°→6°(与 15° 阶梯匹配);
+             速度环 iq_cap 3.5→1.2A / 1.5→0.5A, kp 0.008→0.004,
+             ki 0.05→0.02, 斜坡 2000→1000 eRPM/s。
+       目标是"先不撞、不震", 稳了之后再逐级往上加。 */
+    PositionLoop_Init(&foc->position_loop, 1.0f,
+                      300.0f, 400.0f,
+                      6.0f, 500U,
                       500.0f, config->pole_pairs);
 
     /* ???PWM */
@@ -323,10 +336,32 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
            与真实轴差 ~204°, 只剩 sin(204°)≈-0.40 的转矩且符号相反, 表现为
            "走得动但一冲一停、静摩擦大处彻底卡死、空载也不转"; 之前的
            torque_dir=-1 只是在补符号, 补不了这个相位差. */
-        AngleObserver_CalibrateOffsetAtZero(&foc->angle, foc->hall.state);
-        LOGD("[ALIGN] Align done, hall=%d -> offset calibrated %.1fdeg\n",
-             (int)foc->hall.state,
-             foc->angle.offset * 57.29577951f);
+        /* 2026-09-30 保护: 只有霍尔状态有效(1~6)时才用它校正零点。
+           hall=0/7 是非法状态(常见原因: 霍尔没供电 / 接插件松 → MCU 内部上拉
+           把三相都读成高)。用它校正会把 offset 写成垃圾(实测 hall=0 时 offset
+           被校成 0.0°), 而 offset 错了之后转矩矢量方向全错 —— 现象就是
+           "给了 1.2A 电流, 电机一动不动、Pos 冻结、fb=0"。
+           此时保留上一次的 offset 并报警。 */
+        if (foc->hall.state >= 1U && foc->hall.state <= 6U) {
+            AngleObserver_CalibrateOffsetAtZero(&foc->angle, foc->hall.state);
+            LOGD("[ALIGN] Align done, hall=%d -> offset calibrated %.1fdeg\r\n",
+                 (int)foc->hall.state,
+                 foc->angle.offset * 57.29577951f);
+        } else {
+            /* 2026-10-01 ★★★ 必须直接停机, 不能继续往下跑!
+               没有正确的 offset, theta 就是错的 ⇒ 电流矢量方向错 ⇒ 位置环
+               变成正反馈, 电机会被满力矩抽飞。实测(日志): ALIGN 读不到霍尔
+               (hall=0) → 未标定 → 进位置环后 Pos 一路跑到 -39616° (110 圈)、
+               vsp 撞死 ±3000 限幅、相电流到 5.4A。
+               根因: hall.state 只在 EXTI 里更新, 停机无边沿 ⇒ 一直是初值 0。
+               已在 main.c 的 ADC 中断里每拍轮询霍尔引脚, 现在能读到真值;
+               这里再加一道保险: 读不到就直接 FAULT。 */
+            LOGW("[ALIGN] hall=%d INVALID(0/7) -> FAULT! check hall power/wiring (MCU pull-up reads all-high when unpowered)\r\n",
+                 (int)foc->hall.state);
+            FOC_Control_SetFault(foc, 0x0003);
+            foc->flags.enabled = 0;
+            return;
+        }
         foc->state = FOC_STATE_STARTUP;
         foc->startup_tick = foc->tick;
         foc->current_loop.id_ref = 0.0f;
@@ -376,7 +411,9 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
        否则目标0/45/90 要追几千度 → 永远顶/振/跑飞, 无法调闭环.
        判据放宽到 8eRPM: 霍尔表零点已在 ALIGN 阶段自动校正, 交接后闭环不依赖
        "转多快", 只要霍尔有效即可(原来卡 >20, 实测拖转只有 ~13 就判失败). */
-    if (foc->angle.synced && elapsed > 6000U && fabsf(erpm) > 8.0f) {
+    if (foc->angle.synced &&
+        foc->hall.state >= 1U && foc->hall.state <= 6U &&
+        elapsed > 6000U && fabsf(erpm) > 8.0f) {
         float pos;
         foc->startup_done = 1;
         foc->flags.hall_synced = 1;
@@ -390,7 +427,9 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
            改写的 theta 会在交接后第一次展开时被当成一次大跳变. */
         (void)AngleObserver_GetTheta(&foc->angle, &foc->hall, foc->tick,
                                      foc->config.pwm_freq, 20000U, 1.0f, 1, NULL);
-        foc->angle.elec_acc_deg = 0.0f;
+        /* 2026-10-11c: 位置现在是绝对值算法, 清零要搬参考点(写 elec_acc_deg
+           会在下一拍被覆盖) */
+        AngleObserver_ZeroPos(&foc->angle);
         /* 多边沿测速历史一起清掉: I-F 期间 elec_acc_deg 没在更新, 旧历史
            算出来的差值是无意义的 */
         for (int i = 0; i < 4; i++) {
@@ -398,8 +437,20 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
             foc->angle.edge_hist_acc[i]  = 0.0f;
         }
         foc->angle.edge_hist_idx = 0U;
+        /* ★ 10-11k: 把模型速度也清零。I-F 拖转刚结束的"速度"是开环给的,
+           交接到闭环后转子靠摩擦减速(≈290°/s²), 而模型会带着这个旧速度
+           继续指数衰减地"爬"—— 实测爬了 9.4°机械(0.6 个扇区) ⇒ 位置读数
+           过量、位置环去反推一个其实已经停住的转子(持续振动 + 顶久了塴出去)。 */
+        foc->angle.omega       = 0.0f;
+        foc->angle.omega_filt  = 0.0f;
+        foc->angle.alpha_filt  = 0.0f;
         pos = AngleObserver_GetMechDeg(&foc->angle, foc->config.pole_pairs);
-        foc->pos_target_deg_cmd = pos;
+        /* 2026-10-01: 以前这里无条件把目标清成"原地保持 0°", 于是 ALIGN/
+           STARTUP(~0.6s)期间按的数字键会被静默丢掉 —— 实测"按 r 后马上按 1
+           电机没反应"就是这个。现在只要用户在这轮里设过目标就保留它。 */
+        if (!foc->pos_target_user_set) {
+            foc->pos_target_deg_cmd = pos;
+        }
         LOGD("[STARTUP] Synced erpm=%.0f hold@%.1fdeg\n", erpm, pos);
         return;
     }
@@ -440,13 +491,199 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
     FOC_UpdateCurrent(foc);
 }
 
+/* 位置环增益 (2026-10-01 v3)
+   kp = A/deg, ki = A/(deg·s) 积分, kd = A/eRPM 速度阻尼
+   2026-10-01 改为"强阻尼+低增益+速度门控积分": 该机构静摩擦大(起动~1.15A)、
+   一动又很轻快, 实测出现 **±1个霍尔扇区(±15°机械)、~3Hz 的极限环**
+   (日志: Tgt=45 时 Pos 在 29.20/59.51 之间来回, err 永远 ±15°, arr 永远 0,
+    Iqref 在 ±1.8A 饱和来回; Tgt=0 时同样 ±16°)。
+   能量来源三个: ① kp 太大 ⇒ 相当于继电器, 一冲就过; ② 阻尼用的速度滤波
+   0.1s 太慢(在 3Hz 上有 ~100° 相位滞后, 不但不阻尼反而助推); ③ 积分的
+   90° 相位滞后推着 stick-slip 循环。
+   v3: kp 0.060→0.040; kd 0.0030→0.0060(并在 12ms 快滤波上算);
+   积分只在"转子不动"(|v|<40eRPM)时才增长, 一运动就冻住/缓慢泄放。 */
+#define POS_KP_A_PER_DEG     0.040f
+/* 位置积分 KI(A/(deg·s)): 只当"破静摩擦的小助手", 绝不能主导驱动。
+   ⚠ 2026-10-11 实测教训: 原值 0.25 配上 90° 误差 = **22.5 A/s**, 而门控
+   (|v|<40eRPM) 在起步时天然成立 ⇒ 60ms 就把积分顶到上限 1.4A ⇒ 起步等于
+   "速度环 + 1.4A"≈ 2.5A 满力矩 ⇒ 100ms 内把转子加速到 ~1300°/s(日志:
+   `Pos` 从 -0.01 一跳到 **134.47**, `vsp=590`), 远超规划曲线(当时只允许
+   172eRPM) ⇒ 2.5A 也刹不住 ⇒ 冲过目标 44° → 反向再来 → **±37° 极限环**
+   (Tgt=90 在 59.5°~134.5° 之间永不停)。同时把门控收紧成"真堵转"
+   (POS_INTEG_STALL_TICKS 内没有霍尔边沿) ⇒ 运动中永不积分、不会绕积。 */
+#define POS_KI_A_PER_DEG_S   0.25f
+/* (历史) 阻尼增益 kd 与"近区加大阻尼/速度死区"三个版本(2026-10-09c/e/g)
+   已全部被下面的三段式速度规划(2026-10-09i)取代 —— kd 形式最终败在:
+   ① 冲过目标是因为"误差还是正的 ⇒ P 仍在往前推", 而阻尼上限就那么大,
+      两者相消(实测卡住/过冲时 Iqref 只有 ±0.6~1.5A);
+   ② 停转时观测器残留的"假速度"经 kd 把 P 项抵掉, 还得再加死区去补。
+   现在只用 POS_DAMP_MAX_A 作刹车项限幅。 */
+/* ---- 三段式速度规划限速 (2026-10-09i, 取代旧的"近区阻尼+死区") ----
+   用户要的"启动加速 / 匀速 / 接近目标减速"在这里实现成**只限速、不跟踪**:
+     阶段1 启动: 由 P+积分驱动, 力矩上限 2.5A —— 起步力矩不被削弱(齿槽需
+                ~1.5A 才能拉出, 不能掐)。
+     阶段2 匀速: |v| 被限在 POS_VCRUISE_ERPM(300eRPM ≈ 75 机械rpm ≈ 450°/s)。
+     阶段3 减速: 进目标 POS_DECEL_ZONE_DEG(45°) 内, 允许速度按 γv=K×√d 收缩
+                (15° 处 100eRPM/150°/s, 4° 处 52eRPM, 1° 处 26eRPM) —— 这
+                就是 v²=2·a·d 的运动学减速曲线, 到目标正好降到 0。
+   超过允许速度才刹车, 没超速时阻尼完全为 0 ⇒ 对速度反馈的噪声/边界抖动
+   免疫(真做成速度环会把 ±50~100eRPM 噪声放大成电流抖动, 就是 2026-09-30
+   那次嗡振的成因); 而停转时的"假速度"也不再抵消 P 项。 */
+/* ★★ 2026-10-11b 关键修正: 速度曲线改成**单一 √ 曲线 + 巡航上限**, 去掉
+   "45° 处换段"。10-11a 实测 Tgt=180 又摆不停(90↔207 来回 7 次破黏), 数据算得:
+   在 45° 换段瞬间 v_lim 从 300 一步跳到 174eRPM, 而 v_cmd 只能按 DEC 斜坡下坡
+   (~105ms), 这 105ms 里转子仍以 ~450°/s 飞 ⇒ 误差只剩 30° 时实测速度还有 ~300eRPM
+   (允许值的 2 倍) ⇒ 2.5A 刹车从 528°/s 需要 28° 才停, 而只剩 15° ⇒ **必然冲进
+   下一个齿槽 195.47°**; 而那儿环路只有 -1.3A(P+I 全上也只有这么多)拉不出来
+   (起动要 >1.15A, 齿槽更深) ⇒ 只能靠 200ms/2.5A 破黏脉冲, 而那个脉冲太狠
+   (200ms 把转子甩回 90°, 105° 行程) ⇒ 冲 195 → 踢回 90 → 再冲 = 死循环。
+   所以: ①曲线连续 —— √ 从 d=(V/K)²=100° 起接管, 换段处 200eRPM 两侧相等、无跳变;
+   ②巡航 300→200eRPM(450→300°/s), 动能降到 1/2; ③KV 0.010→0.015,
+   同样 100eRPM 误差给 1.5A ⇒ 跟得住曲线; ④破黏脉冲 200ms→60ms 且"一见霍尔
+   边沿立刻收手" ⇒ 它只负责"破"黏, 不再负责"推"。 */
+#define POS_VCRUISE_ERPM     200.0f  /* 巡航速度(eRPM) ≈ 50 机械rpm ≈ 300°/s */
+#define POS_ACC_ERPM_S       1200.0f /* 加速段加速度上限(eRPM/s) */
+#define POS_DEC_ERPM_S       2000.0f /* 减速段减速度上限(eRPM/s) */
+#define POS_JERK_ERPM_S2    12000.0f /* 加加速度上限(eRPM/s²): 加速度用 100ms 升满 */
+#define POS_DECEL_ZONE_DEG  100.0f   /* =(V_CRUISE/K)²: 超过它才被巡航限住 */
+#define POS_DECEL_K_ERPM     20.0f   /* v_lim=K×√d: 100°→200, 45°→134, 15°→77eRPM */
+#define POS_KV_A_PER_ERPM    0.015f  /* 速度环增益(A/eRPM): 100eRPM 误差 → 1.5A */
+/* 驱动电流限幅(2026-10-11g): 与"刹车"分开。
+   ⚠ 本机构非常轻 + 阻滞大: 要动必须 >1.15A(过静摩擦), 而 1.15A 在它身上
+   就是 ~10000°/s² —— 实测 1.86A 下 34ms 就飞到 674°/s。若驱动不单独限幅,
+   起步就是 2.5A 满推 ⇒ 两三个扇区就冲过目标 15~80°。
+   这里把**驱动**(电流方向与运动同向)限在 1.6A(刚好过静摩擦); **刹车**
+   (电流与运动反向)仍放开到 POS_DAMP_MAX_A(2.5A), 保证刹得住。
+   卡在齿槽里需要更大扭矩时, 由"堵转才增长的位置积分"(最多 0.8A)补上,
+   总上限仍是 POS_IQ_CAP_A(2.5A) —— 也就是"平时温柔、卡住时凶"。 */
+#define POS_IQ_RUN_A         1.6f    /* 驱动(加速)方向电流上限 */
+#define POS_ARRIVE_V_ERPM    40.0f   /* 到位还需 |v|<它: 还在飞就继续用环刹车 */
+/* ★ 2026-10-11j "温柔脱困区": |err| 小于它时, 一旦"基本没动"就不再给
+   速度环驱动电流, 只让堵转积分慢慢长到破黏阈值(≈1.2~1.6A)。
+   理由(本机物理): 1.15A 是静摩擦阈值, 而 1.86A 就能把转子推到 674°/s —— 
+   脱困扭矩离阈值越近, 加速度越小(≈1000~2000°/s² 而不是 8000+), 走完一个
+   齿槽(15.5°)就慢得多, 环路才有机会在"下一个齿槽"把它刹住。远目标(|err|
+   大)时照旧全速驱动——那里走得快才重要。 */
+#define POS_GENTLE_ZONE_DEG  20.0f
+#define POS_INTEG_MAX_A      1.0f    /* ★10-11k 1.6→1.0: 积分只做"静态小误差/齿槽内偏移"的
+                                        慢补偿。"脱困"完全交给下面的破黏脉冲 —— 因为实测
+                                        1.6A 持续顶着只能把转子顶死在齿槽壁上(发出持续振动), 
+                                        顶久了还会突然蹦出去(日志: 顶 400ms 后猛地飞 32°)。 */
+/* 总限幅与阻尼限幅必须同时抬到 2.5A(2026-10-09f): 实测冲过目标的机理是
+   —— 转子被 1.5A 拉出齿槽后开始移动, 而此时 **误差还是正的**(还没过目标),
+   所以 P 项在不断“向前推”(如 0.04×29.5=1.18A), 而阻尼只能反向拉到
+   修改前的 1.4A ⇒ 两者几乎相消(日志: 1.53A → 冲出去 52°), 转子几乎靠惯性
+   滑过目标; 只有过了目标 P 才翻号、刹车才真正生效 ⇒ 必然冲一个大扇区。
+   把两者都抬到 2.5A 后, 高速时阻尼 = kd(0.012)×v 可达 2.5A > P, 净输出
+   变成刹车, 过目标前就能减速。
+   安全: 2.5A 与破黏脉冲/align(2A) 同量级, 远低于过流 6A; 电流环 vlim=0.45
+   占空比 ⇒ 10.8V/0.52Ω 能出 20A, 完全推得动(实测破黏时的 2.5A 已证实)。 */
+#define POS_IQ_CAP_A         2.5f    /* 总电流上限(ALIGN 用 2A 都没事) */
+#define POS_DAMP_TAU_S       0.012f  /* 阻尼用速度低通时间常数(原 0.1s 太慢) */
+#define POS_DAMP_MAX_A       2.5f    /* 阻尼项限幅(曾 0.7/1.4, 见上面注释) */
+#define POS_INTEG_GATE_ERPM  40.0f   /* |v| 超过它就算"在动", 积分冻结 */
+#define POS_INTEG_STALL_TICKS (150U * 20U)   /* 另有此条: 150ms 无霍尔边沿才算堵转 */
+/* ⚠ 2026-10-11b 再加一条: "想动"持续 POS_INTEG_ARM_TICKS 之后积分才被允许增长。
+   光靠"150ms 无边沿"不够 —— 换目标的一瞬间转子本来就静止(停在旧目标上),
+   天然满足"150ms 无边沿" ⇒ 积分会从第 150ms 就开始按 0.10×90°=9A/s 往上顶
+   ⇒ 又变成"靠积分冲出去"(10-11a 的病)。加了这条之后: 起步阶段规划器虽然
+   立刻要求运动(v_tgt≠0), 但积分要等 300ms 才"开闸", 那之前转子早该动起来
+   (有霍尔边沿 ⇒ 堵转条件不成立 ⇒ 积分冻结); 只有真的卡在齿槽里不动,
+   "想动 300ms + 150ms 无边沿" 才同时成立 ⇒ 积分只做"破齿槽助手"。 */
+#define POS_INTEG_ARM_TICKS   (300U * 20U)   /* "想动"多久才允许积分增长 */
+
+/* ---- 堵转破黏脉冲 (2026-10-09) ----
+   实测日志: Tgt=90 时转子冲过头到 105.47° 后卡死, 800ms 没有霍尔边沿, 而
+   Iqref 只有 -1.32A(= P 0.040x(-15.5)=-0.62A + 积分 -0.70A) —— 该转子位置的
+   静摩擦阈值落在 1.3~1.6A 之间, 环路自己给不出更大的力(1.8A 的 cap 根本没用上),
+   于是"永远差 15°"; 而再按 0(-1.60A)就动了。
+   这里只加一个"确实不动 + 误差仍大"才触发的短脉冲: 把电流上限临时抬到
+   2.5A 打 200ms 破黏, 打完立刻回到正常律。**不抬高环路增益**(2026-09-30 那次
+   增益太高导致 ±5Hz 硬限位来回撞), 所以正常运动/到位时行为完全不变。
+   触发: |err|>容差 且 距上次霍尔边沿 > 400ms(真不动) 且 距上次脉冲 > 800ms。
+   安全: 2.5A 与 align(2A) 同量级, 远低于过流 6A / 手动硬保护 6A。 */
+#define POS_KICK_A              2.5f
+#define POS_KICK_TICKS          (100U * 20U)   /* 脉冲时长上限(20kHz tick): 只负责"破"黏 */
+/* ★★ 2026-10-11k: 为什么脉冲变强变长 + 为什么要"预置电流环积分"
+   实测(10-11j 日志): 2.2A/60ms 的脉冲几乎没出力 —— 电流环很慢
+   (kp=0.010/ki=0.300 duty/(A·s), 1A 误差下积分只涨 0.3duty/s, 而 1.6A 静稳只要
+   0.045duty) ⇒ 要 ~250ms 才把电流建立起来, 60ms 里实际电流只到 0.2A 量级, 
+   而位置积分却要 400ms 才顶到 1.6A ⇒ 两头都不是"干脆的一下"。
+   现在: ① 脉冲启动时**预置 q 轴积分**(= I×R/vbus, 见 POS_FF_DUTY_PER_A) ⇒ 电流
+   1ms 内到位(电流环时间常数 L/R≈0.6ms), 脉冲才真的有力;
+   ② 时长 100ms, 速度一超 POS_KICK_EXIT_ERPM 立刻收手;
+   ③ 脉冲一开始就把位置积分清零; 脉冲结束后进入休息(受 POS_KICK_COOLDOWN_TICKS
+   封住) —— **休息期间不再有任何持续推力**。这一点是用户反馈"到位后小幅振动"
+   的关键: 原来靠"位置积分顶到 1.6A 一直顶着", 转子被顶在齿槽壁上,
+   电流纹波+角度误差就变成持续可感的振动, 顶久了还会蹦出去(9.5A 过流跳闸)。 */
+#define POS_FF_DUTY_PER_A       0.028f  /* 堵转时每 1A 需要的占空比(实测 1.6A→vq≈0.045) */
+/* ★ 2026-10-11k 误差符号抖动抑制:
+   位置读数在扇区内的分辨率极限就是**半个霍尔扇区**(15.47°/2≈7.7°机械) —— 
+   目标附近 err 会在 ±8° 里反复翻号(模型进角/边沿重置的噪声), 环路于是
+   "推一下→读数翻号→反推一下" = 用户看到的小幅振动。所以近目标且符号
+   刚翻过时, 一律不给任何电流, 等符号稳定下来再说。 */
+#define POS_HOLD_BAND_DEG       10.0f
+#define POS_ERR_HYST_TICKS      (150U * 20U)
+/* 脱困刹车只在该刹的时候给: 速度掉到它以下就立刻松手 */
+#define POS_ESC_BRAKE_V_ERPM    60.0f
+#define POS_ESC_BRAKE_MIN_TICKS (25U * 20U)
+/* ★ 2026-10-11h: 破黏脉冲**一见转动就收手**(|v| 超过它就不再强搭)。
+   实测(10-11g): 60ms×2.2A 脉冲把转子推到 ~1300°/s, 而 2.5A 刹车需要 34°
+   才能停 ⇒ 从 105.47 一口气飞过目标到 44.48(反而差 +45°), 再被推回来 ⇒ 极限环。
+   现在只要速度一上来(60eRPM=90°/s)就立即交回速度环, 由它把速度压在规划曲线上。 */
+#define POS_KICK_EXIT_ERPM     60.0f
+/* ★ 2026-10-11j "脱困刹车": 本机的硬约束是"速度只能按扇区知道" ——
+   堵转之后的第一条边沿，只能告诉你"刚刚跨了 15.5°"，而在那之前
+   无论如何都拿不到速度(窗口估计里混着堵转那段)。所以第一个 15.5° 是
+   无法控制的。既然齿槽间距就是 15.5°，最巧的策略就是:
+     **从齿槽脱困→让它走一个齿槽→立刻全刹车** ⇒ 刚好停在下一个齿槽。
+   而"卡在目标旁一个齿槽"正是最常见的工况 ⇒ 一次就到位。 */
+#define POS_ESCAPE_BRAKE_TICKS (100U * 20U)
+#define POS_KICK_STALL_TICKS   (400U * 20U)    /* 判"堵转"的静止时长 */
+#define POS_KICK_COOLDOWN_TICKS (800U * 20U)   /* 两次脉冲最小间隔 */
+
+/* 位置环积分项(A) 与 阻尼用滤波速度(eRPM) */
+static float s_pos_integ = 0.0f;
+static float s_pos_erpm_filt = 0.0f;
+/* 位置差分测速用(2026-10-11g): 10ms 窗口, 无滞后 */
+static float    s_pos_vdiff_deg  = 0.0f;
+static uint32_t s_pos_vdiff_tick = 0U;
+/* 脱困刹车状态(2026-10-11j) */
+static uint8_t  s_pos_esc_stalled = 0U;
+static uint32_t s_pos_brake_end   = 0U;
+/* 误差符号抖动抑制(2026-10-11k): 上次误差符号 + 最后一次翻号时刻 */
+static int8_t   s_pos_err_sign    = 0;
+static uint32_t s_pos_err_flip_tick = 0U;
+
+/* 速度规划器状态(2026-10-09j): 当前命令速度(eRPM) 与命令加速度(eRPM/s) */
+static float s_pos_v_cmd = 0.0f;
+static float s_pos_a_cmd = 0.0f;
+
+/* 破黏脉冲状态 */
+static uint32_t s_pos_kick_end_tick  = 0U;   /* > foc->tick 表示脉冲进行中 */
+static uint32_t s_pos_kick_next_tick = 0U;   /* 下一次允许触发的时刻 */
+static uint32_t s_pos_kick_edge_tick = 0U;   /* 脉冲开始时的霍尔边沿计数(见下) */
+static uint16_t s_pos_kick_cnt       = 0U;   /* 累计脉冲数(日志用) */
+/* 位置积分"开闸"计时: 规划器持续要求运动 POS_INTEG_ARM_TICKS 之后才非 0 */
+static uint32_t s_pos_arm_tick       = 0U;
+
+/* 位置环堵转报警标志: 一旦报警就保持, 直到误差回到容差内才复位 */
+static uint8_t s_pos_blocked_logged = 0U;
+/* "本轮超差"起点: 换目标/刚起步时 err 必然大, 但"刚起步"不等于"堵转"。
+   原来只看"距上次霍尔边沿", 而停在到位点时本来就没有边沿 ⇒ 一按目标键立刻
+   误报(实测: `Set tar[POS] BLOCKED? err=45.5deg, no hall edge for 11897ms`,
+   同时把破黏脉冲也误触发了一次)。改为计时"err 连续超差"的时长。 */
+static uint32_t s_pos_err_run_tick = 0U;
+/* 位置环"飞车"计时: 滤波速度持续超过门限的拍数 */
+static uint32_t s_pos_fast_cnt = 0U;
+
 static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
 {
     float erpm_now;
     float iq_target;
     float pos_now_deg;
-    float speed_target;
     int8_t saved_torque;
+    uint32_t err_run = 0U;   /* "err 已连续超差"的拍数(见下面的堵转看门狗) */
 
     /* ??????? */
     FOC_UpdateAngle(foc, &erpm_now);
@@ -479,32 +716,369 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
     pos_now_deg = AngleObserver_GetMechDeg(&foc->angle, foc->config.pole_pairs);
 
     /* ????? */
-    speed_target = PositionLoop_Update(&foc->position_loop,
-                                       pos_now_deg,
-                                       foc->pos_target_deg_cmd,
-                                       dt_s,
-                                       foc->tick);
+    /* 只保留它维护 pos_err_deg / arrived(供显示与到位判断); 速度指令不再使用 */
+    (void)PositionLoop_Update(&foc->position_loop,
+                              pos_now_deg,
+                              foc->pos_target_deg_cmd,
+                              dt_s,
+                              foc->tick);
 
-    s_erpm_filt += 0.0005f * (erpm_now - s_erpm_filt);
+    /* 阻尼用的速度反馈用 **快滤波**(τ=12ms). 原来与速度环共用 s_erpm_filt
+       (τ=0.1s), 在 ~3Hz 的位置振荡上有 ~100° 相位滞后 ⇒ 阻尼项变成"助推"。
+       ---- 2026-10-11g 再加一路无滞后测速 ----
+       `erpm_now` 只有霍尔边沿测速: 边沿之间是保持值, 窗口估计还跨 3 个扇区
+       (~45°机械)取平均 ⇒ 加速/减速时严重滞后。实测(10-11f 日志): 转子已在
+       扇区内飞过 23.1°(≈674°/s), 而环路只看到 84eRPM(差 8 倍) ⇒ 环路以为
+       "还没到规划速度", 继续正推(1.86A) ⇒ 一直推到冲过目标 15~80° 才看到
+       高速去反拉 ⇒ ±2.5A 来回摆几转停不下来。
+       位置现在是绝对值算法(连续、无歧义) ⇒ 直接用**位置差分**(10ms 窗口)
+       算速度: 无滞后。两路取**幅值较大者**: 宁可高估(多刹一点, 安全),
+       绝不低估(低估 = 跑飞/冲过头)。 */
+    {
+        uint32_t dtk = foc->tick - s_pos_vdiff_tick;
+        if (dtk >= 200U) {                                   /* 10ms 窗口 */
+            float v_pos = (pos_now_deg - s_pos_vdiff_deg)
+                          / (float)dtk * 20000.0f / 1.5f;    /* deg/s → eRPM */
+            s_pos_vdiff_deg  = pos_now_deg;
+            s_pos_vdiff_tick = foc->tick;
+            if (fabsf(v_pos) > fabsf(erpm_now)) erpm_now = v_pos;
+        }
+    }
+    s_pos_erpm_filt += (dt_s / POS_DAMP_TAU_S) * (erpm_now - s_pos_erpm_filt);
 
-    /* ---- 到位后速度环积分平滑泄放 ----
-       起步/加速阶段速度环积分会被限幅顶到 ~1.5A, 而 err≈0 时它几乎不下降
-       (iq = kp*err + integ 一直输出满电流). 电机被大扭矩顶着不动, 此时霍尔
-       若在扇区边界来回跳, theta 每拍跳 ~60° → 转矩矢量跟着翻 → 剧烈振动.
-       这里在到位容差内给积分一个 ~0.15s 的泄放, 让扭矩平滑回落到 kp*err≈0.
-       注意: 只泄放积分、闭环保持; 不能像硬切 0 力矩那样处理——那会让转子
-       失去阻尼, 靠惯性滑出容差带再被拉回, 变成"动一下停一下"的蠕动. */
-    if (fabsf(foc->position_loop.pos_err_deg) < foc->position_loop.arrive_tol_deg) {
-        foc->speed_loop.integ *= (1.0f - dt_s / 0.15f);
+    /* ---- 跑飞保护 (2026-10-01 ★新增, 安全兵) ----
+       位置环必须有"跑飞"兜底: 一旦角度/方向出错(实测: ALIGN 未标定 offset),
+       闭环会变成正反馈, 电机一路加速 —— 日志里 Pos 到过 -39616°(110 圈)、
+       vsp 撞死 ±3000 限幅、相电流 5.4A、机构被抽得飞快。两道门:
+       ① 位置偏离目标超过 720°(2 圈) —— 任何正常运动都不可能;
+       ② 滤波速度持续 200ms(4000 拍) 超过 1500eRPM —— 飞车。
+       命中就 FAULT + 关 PWM, 按 'r' 清故障重来。 */
+    if (fabsf(foc->position_loop.pos_err_deg) > 720.0f) {
+        LOGW("[POS] RUNAWAY: err=%.0fdeg > 720 -> FAULT\r\n",
+             foc->position_loop.pos_err_deg);
+        FOC_Control_SetFault(foc, 0x0010);
+        s_pos_fast_cnt = 0U;
+        return;
+    }
+    if (fabsf(s_pos_erpm_filt) > 1500.0f) {
+        s_pos_fast_cnt++;
+        if (s_pos_fast_cnt > 4000U) {
+            LOGW("[POS] RUNAWAY: |vsp|=%.0feRPM -> FAULT\r\n", s_pos_erpm_filt);
+            FOC_Control_SetFault(foc, 0x0011);
+            s_pos_fast_cnt = 0U;
+            return;
+        }
+    } else {
+        s_pos_fast_cnt = 0U;
     }
 
-    iq_target = SpeedLoop_Update(&foc->speed_loop,
-                                 s_erpm_filt,
-                                 speed_target,
-                                 dt_s,
-                                 foc->tick);
+    /* ---- 堵转看门狗(2026-10-01, 2026-10-09 修误报) ----
+       位置误差还大、但霍尔超过 0.8s 没跳边沿 = 转子根本没动(机械卡死/到限位/
+       角度估计失效). 只报警不停机, 便于区分"算法不动"和"机构动不了". 报一次.
+       ⚠ 原来只看"距上次霍尔边沿 > 0.8s", 而**停在到位点时本来就没有边沿** ⇒
+       一按目标键就误报(实测: `[POS] BLOCKED? err=45.5deg, no hall edge for
+       11897ms` —— 转子在 44.48° 停着 hold, 并不是堵转). 现在改为要求"err 本轮
+       连续超差 > 0.8s", 换目标/刚起步时计时从 0 重新起算。 */
+    {
+        float err_now = foc->position_loop.pos_err_deg;
+        uint32_t since_edge = foc->tick - foc->hall.edge_tick;
+
+        if (fabsf(err_now) > foc->position_loop.arrive_tol_deg) {
+            if (s_pos_err_run_tick == 0U) s_pos_err_run_tick = foc->tick;
+        } else {
+            s_pos_err_run_tick = 0U;
+        }
+        err_run = (s_pos_err_run_tick == 0U) ? 0U
+                                             : (foc->tick - s_pos_err_run_tick);
+
+        if (err_run > 16000U && since_edge > 16000U) {
+            if (!s_pos_blocked_logged) {
+                s_pos_blocked_logged = 1;
+                LOGW("[POS] BLOCKED? err=%.1fdeg, no hall edge for %lums (Iqref=%.2fA)\n",
+                     err_now, (unsigned long)(since_edge / 20U),
+                     foc->current_loop.iq_ref);
+            }
+        } else {
+            s_pos_blocked_logged = 0U;
+        }
+    }
+
+    /* ---- 位置环律 v4 (2026-10-01): 到位完全撤力矩; 运动中 P + 限幅阻尼 + 门控积分 ----
+       v1(纯 PD kp=0.025) 出不了力; v2(+积分 kp=0.06) 到位后在目标周围 ±1 个霍尔
+       扇区、~3Hz 振荡; v3(低增益+强阻尼+速度门控积分) 能把目标走到了
+       (`Pos=90.00 err=-0.00 arr=1`、`Pos=44.48 arr=1` 都出现过), 但**到位后
+       会嗡嗡振**: 日志显示 err=0.00 而 `vsp=±250eRPM`、`Iqref` 在 ±1.7A 来回。
+       原因: err≈0 ⇒ 电流全部来自阻尼项 -kd*v, 而 v 在霍尔边界抖动时是尖刺,
+       乘 kd=0.006 就变成 ±1.5A 真电流 —— 把机构掘起(交叉堆掘/爬行),
+       偏偏位置反馈对扇区内的掘动又"看不见"(adv 被限幅) ⇒ 自激嗡嗡。
+       v4: ① 到位(|err|<容差) 时 **完全撤力矩**(靠静摩擦保持, 不发热, 也不会
+       自激); ② 运动中阻尼项限幅 ±0.7A, 不让测速尖刺直接变成大电流。
+       v4 的关键还有**不要让总电流饱和**: 饱和后 iq=clamp(p+d+∫) 里阻尼项被
+       限幅吃掉 ⇒ 阻尼完全失去权限, 控制律退化成继电器 ⇒ 必然极限环
+       (日志: Tgt=0 时 Iqref 恒 ±1.80A 来回、vsp ±700、Pos 在 ±16° 之间荡)。
+       所以把 总限幅压到 1.6A、积分限幅压到 0.7A:
+         卡住时 p+∫ ≤ 0.66+0.7 = 1.36A > 起动阈值 ~1.15A ⇒ 起得来;
+         动起来时 p+d+∫ ≈ 0.66-0.7+0.7 = 0.66A < 阈值 ⇒ 自然减速停住。 */
+    {
+        float err = foc->position_loop.pos_err_deg;
+        float v   = s_pos_erpm_filt;
+
+        /* ---- 脱困刹车计时(2026-10-11j) ----
+           堵转(边沿间隔 > 400ms)期间置标志; 一出现新边沿且近目标 ⇒ 启动一段
+           强制全刹车(见 POS_ESCAPE_BRAKE_TICKS 注释)。 */
+        {
+            uint32_t se = foc->tick - foc->hall.edge_tick;
+            if (se > POS_KICK_STALL_TICKS) {
+                s_pos_esc_stalled = 1U;
+            } else if (se < 5U && s_pos_esc_stalled) {
+                s_pos_esc_stalled = 0U;
+                if (fabsf(err) < POS_GENTLE_ZONE_DEG) {
+                    s_pos_brake_end = foc->tick + POS_ESCAPE_BRAKE_TICKS;
+                }
+            }
+            /* ★ 10-11k: 刹车只在该刹的时候给 —— 速度掉下来就立刻松手。
+               原来无论速度多少都硬顶 100ms×2.5A ⇒ 转子早已停住还在被反推
+               近 100ms(等于"持续反推"), 既振动又可能把它倒推出齿槽。 */
+            if (s_pos_brake_end != 0U) {
+                uint32_t active = foc->tick - (s_pos_brake_end - POS_ESCAPE_BRAKE_TICKS);
+                if (foc->tick >= s_pos_brake_end ||
+                    (active > POS_ESC_BRAKE_MIN_TICKS &&
+                     fabsf(v) < POS_ESC_BRAKE_V_ERPM)) {
+                    s_pos_brake_end = 0U;
+                    s_pos_integ     = 0.0f;
+                }
+            }
+        }
+
+        /* ★ 10-11k 误差符号翻号检测(抖动抑制, 见 POS_HOLD_BAND_DEG 注释) */
+        {
+            int8_t sgn = (err > 0.0f) ? 1 : ((err < 0.0f) ? -1 : 0);
+            if (sgn != 0 && sgn != s_pos_err_sign) {
+                s_pos_err_sign      = sgn;
+                s_pos_err_flip_tick = foc->tick;
+            }
+        }
+
+        if (fabsf(err) < foc->position_loop.arrive_tol_deg &&
+            fabsf(v) < POS_ARRIVE_V_ERPM) {
+            /* 到位(且在容差内已经不快了): 撤力矩 + 清零积分 */
+            iq_target = 0.0f;
+            s_pos_integ = 0.0f;   /* ★10-11k: 到位就是"放手", 积分直接清零(原来只泄放) */
+            /* 到位即清脉冲与规划器: 下次移动可从零开始 */
+            s_pos_kick_end_tick  = 0U;
+            s_pos_kick_next_tick = 0U;
+            s_pos_arm_tick       = 0U;
+            s_pos_v_cmd = 0.0f;
+            s_pos_a_cmd = 0.0f;
+        } else {
+            /* ⚠ 2026-10-11b: 进门多了"|v|<POS_ARRIVE_V_ERPM"这一条 —— 原来只要
+               |err|<6° 就拓力矩, 而进容差时往往还有上百 eRPM 速度 ⇒ 靠惯性滑出去
+               一个齿槽(15°)又变超差 ⇒ 在容差带边上反复。现在 "还在飞" 就不撤力矩,
+               继续由下面的速度环把它杀回到接近 0 再撒手。 */
+            /* ======== 位置 → 速度规划: jerk 受限 S 曲线 (2026-10-09j) ========
+               用户要求"启动慢加速 → 匀速 → 接近目标减速"并按段划分。这里用
+               加加速度受限的 S 曲线速度规划器, 7 个自然段(加速、减速各自再细分
+               就是常说的 9 段):
+                 ①加速起头(jerk+) ②恒加速 ③加速收尾(jerk-) ④匀速
+                 ⑤减速起头(jerk-) ⑥恒减速 ⑦减速收尾(jerk+)
+               ★ 与上一版的关键区别: 上一版只"限速不跟踪" ⇒ 驱动(P+积分 1.5~2.4A)
+                 要靠 0.015×超速 去平衡 ⇒ 实际速度会稳在"允许速度 + 驱动/0.015"
+                 (比允许速度高一倍!) ⇒ 过冲、目标附近大幅左右摆(实测 Tgt=180
+                 在 120°~200° 之间荡)。现在速度是**被命令并被跟踪**的:
+                      iq = Kv×(v_cmd − v) + 位置积分
+                 速度被真正压在规划曲线上, 接近目标时 v_cmd→0 ⇒ 平滑停住。
+               ★ 也不再要位置 P 项: P 与速度环互相顶正是"高出允许速度一倍"的
+                 成因; 位置静差交给积分(它本来就是位置积分), 而积分只在"卡住
+                 不动"时增长(破齿槽用), 不参与正常运动 ⇒ 不会来回摆。 */
+            float iq_drive;
+            {
+                float dist = fabsf(err);
+
+                /* 巡航限速 与 进近减速曲线 v=√(2ad) */
+                float v_lim = (dist < POS_DECEL_ZONE_DEG)
+                                  ? POS_DECEL_K_ERPM * sqrtf(dist)
+                                  : POS_VCRUISE_ERPM;
+                if (v_lim > POS_VCRUISE_ERPM) v_lim = POS_VCRUISE_ERPM;
+                float v_tgt = (err > 0.0f) ? v_lim : -v_lim;
+
+                /* 积分"开闸"计时(见 POS_INTEG_ARM_TICKS 注释): 只要规划器还在
+                   要求运动就算"想动", 从第一次要求开始计时 */
+                if (fabsf(v_tgt) > 1.0f) {
+                    if (s_pos_arm_tick == 0U) s_pos_arm_tick = foc->tick;
+                } else {
+                    s_pos_arm_tick = 0U;
+                }
+
+                /* ★★ 2026-10-11e 关键修正: 误差方向一变(转子越过目标), 立刻把命令
+                   速度 v_cmd 清 0。这就是"摆不停"的元凶。
+                   实测数据(10-11d 日志, Tgt=90): 转子刚冲过目标(err 由正变
+                   -15.5°), 环路却还在出 **+1.28A 正推**, 而当时 vsp 只有 66eRPM
+                   ⇒ 反推 0.015×(v_cmd−v)=1.28 得 **v_cmd≈+150** —— 即规划器还
+                   在从 +200 按 DEC 斜坡往下走, 要 100~150ms 才变负。这 100~150ms
+                   里 2.5A 继续往前推 ⇒ 多冲 **+500~750eRPM**(实测峰值 547/729eRPM,
+                   而规划只允许 ≤190eRPM) ⇒ 冲过去 60~90° ⇒ 反向再来一次 ⇒ 在
+                   0~105° 之间来回摆几秒, 每次都靠耗尽动能才停。
+                   原理上: 越过目标时"正确速度"就是 0(或反向的很小值), 没有任何
+                   理由保留上一个方向的命令速度 ⇒ 直接清 0, 下一拍从 0 重新向
+                   新方向规划。方向突变 = 一步刹车(jerk 大但只是把电流从正拽到
+                   负, 不会造成机械冲击/撞限位)。 */
+                if ((err > 0.0f && s_pos_v_cmd < 0.0f) ||
+                    (err < 0.0f && s_pos_v_cmd > 0.0f)) {
+                    s_pos_v_cmd = 0.0f;
+                    s_pos_a_cmd = 0.0f;
+                }
+
+                /* ①②③⑤⑥⑦: v_cmd 向 v_tgt 平滑逼近(限加速度 + 限 jerk) */
+                {
+                    float dv     = v_tgt - s_pos_v_cmd;
+                    float a_need = dv / dt_s;
+                    float a_max  = (dv > 0.0f) ? POS_ACC_ERPM_S : POS_DEC_ERPM_S;
+
+                    if (a_need >  a_max) a_need =  a_max;
+                    if (a_need < -a_max) a_need = -a_max;
+
+                    float da     = a_need - s_pos_a_cmd;
+                    float da_max = POS_JERK_ERPM_S2 * dt_s;
+                    if (da >  da_max) da =  da_max;
+                    if (da < -da_max) da = -da_max;
+
+                    s_pos_a_cmd += da;
+                    s_pos_v_cmd += s_pos_a_cmd * dt_s;
+                    /* 不许冲过目标速度(否则会在目标速度上下反复) */
+                    if ((dv > 0.0f && s_pos_v_cmd > v_tgt) ||
+                        (dv < 0.0f && s_pos_v_cmd < v_tgt)) {
+                        s_pos_v_cmd = v_tgt;
+                        s_pos_a_cmd = 0.0f;
+                    }
+                }
+
+                /* 速度环: 命令速度 vs 实测速度。 */
+                iq_drive = POS_KV_A_PER_ERPM * (s_pos_v_cmd - v);
+                {
+                    float iq_lim = POS_IQ_RUN_A;
+                    if ((v > 0.0f && iq_drive < 0.0f) ||
+                        (v < 0.0f && iq_drive > 0.0f)) {
+                        iq_lim = POS_DAMP_MAX_A;
+                    }
+                    if (iq_drive >  iq_lim) iq_drive =  iq_lim;
+                    if (iq_drive < -iq_lim) iq_drive = -iq_lim;
+                }
+                /* ★★ 2026-10-11j 温柔脱困: 近目标 + 基本没动 ⇒ 撤掉速度环驱动,
+                   只靠积分慢慢顶(见 POS_GENTLE_ZONE_DEG 注释) */
+                if (fabsf(err) < POS_GENTLE_ZONE_DEG &&
+                    fabsf(v) < POS_INTEG_GATE_ERPM) {
+                    iq_drive = 0.0f;
+                }
+            }
+
+            /* 位置积分: 只在"确实动不了"时才增长。三个条件必须同时成立:
+               ① 规划器已持续要求运动 300ms(开闸, 防"换目标就靠积分冲");
+               ② 滤波速度接近 0;  ③ 150ms 没有霍尔边沿(真没动)。
+               正常运动时①②③至少一个不成立 ⇒ 积分冻结/按 0.1s 泄放。 */
+            if (s_pos_arm_tick != 0U &&
+                (foc->tick - s_pos_arm_tick) > POS_INTEG_ARM_TICKS &&
+                fabsf(v) < POS_INTEG_GATE_ERPM &&
+                (foc->tick - foc->hall.edge_tick) > POS_INTEG_STALL_TICKS) {
+                float pre = iq_drive + s_pos_integ;
+                if (!((pre >  POS_IQ_CAP_A && err > 0.0f) ||
+                      (pre < -POS_IQ_CAP_A && err < 0.0f))) {
+                    s_pos_integ += POS_KI_A_PER_DEG_S * err * dt_s;
+                    if (s_pos_integ >  POS_INTEG_MAX_A) s_pos_integ =  POS_INTEG_MAX_A;
+                    if (s_pos_integ < -POS_INTEG_MAX_A) s_pos_integ = -POS_INTEG_MAX_A;
+                }
+            } else if (fabsf(v) >= POS_INTEG_GATE_ERPM) {
+                /* ★★ 2026-10-11i: 转子一旦真动起来, 积分的任务(破齿槽)就完成了,
+                   必须**立即清零**。原来只按 τ=0.1s 衰减 ⇒ 脱困后那 1.2A 会:
+                   ① 和驱动相加, 使总电流回到 2.5A 继续猛推(实测脱困后 vsp 冲到
+                      ±500eRPM, 行程 40~50°);
+                   ② 刹车时把反向 2.5A 吃掉一半(-2.5+1.2 = -1.3A) ⇒ 刹车距离从
+                      12° 变成 24° ⇒ 飞出去停不下来。
+                   清零只是一次"电流下降", 不会造成冲击；下次卡住它会重新长回来。 */
+                s_pos_integ = 0.0f;
+            } else {
+                s_pos_integ *= (1.0f - dt_s / 0.10f);
+            }
+
+            iq_target = iq_drive + s_pos_integ;
+
+            /* ---- 堵转破黏脉冲 ----
+               ⚠ 原版只把"上限"抬到 2.5A —— 实测那是**空操作**: 卡住时环路自己
+               只出 -1.32A(或更糟的 -0.01A), 本来就低于 1.8A 的原上限, 抬上限
+               根本不多给力; 日志里 STICTION kick 打了但 Iqref 一点没变。
+               现在: 脉冲期间**强制**按误差方向给定 POS_KICK_A(绕过速度环+积分)。
+               ★★ 2026-10-11b: 脉冲 200ms→60ms, 并且**一见霍尔边沿立刻收手**
+               (see s_pos_kick_edge_tick)。原因(2026-10-11 实测): 200ms/2.5A 对
+               这个很轻的转子 = ~5000°/s², 200ms 里跑 100° —— 从 195.47° 卡点
+               直接飛回 90°, 而 90° 又是另一个齿槽 ⇒ 环路在 90° 又把转子推到 195°
+               ⇒ **90↔207 永动极限环**(日志里连打 7 次破黏)。现在脉冲只负责
+               "把齿槽掰开", 一有边沿就松手, 由速度环接管减速/定位。 */
+            {
+                uint32_t since_edge = foc->tick - foc->hall.edge_tick;
+                uint8_t  kicking = 0U;
+
+                if (s_pos_kick_end_tick != 0U && foc->tick < s_pos_kick_end_tick &&
+                    foc->hall.edge_tick == s_pos_kick_edge_tick &&
+                    fabsf(s_pos_erpm_filt) < POS_KICK_EXIT_ERPM) {
+                    kicking = 1U;                      /* 脉冲进行中、还没动、速度还小 */
+                } else if (err_run > POS_KICK_STALL_TICKS &&
+                           since_edge > POS_KICK_STALL_TICKS &&
+                           fabsf(err) > POS_HOLD_BAND_DEG &&
+                           (s_pos_kick_next_tick == 0U || foc->tick >= s_pos_kick_next_tick)) {
+                    s_pos_kick_end_tick  = foc->tick + POS_KICK_TICKS;
+                    s_pos_kick_next_tick = s_pos_kick_end_tick + POS_KICK_COOLDOWN_TICKS;
+                    s_pos_kick_edge_tick = foc->hall.edge_tick;
+                    s_pos_kick_cnt++;
+                    kicking = 1U;
+                    /* ★10-11k: 脉冲是"干净的一下" —— 位置积分清零(不叠加),
+                       并预置电流环积分让脉冲 1ms 内就达到目标电流 */
+                    s_pos_integ = 0.0f;
+                    CurrentLoop_SetQInteg(&foc->current_loop,
+                                          ((err > 0.0f) ? POS_KICK_A : -POS_KICK_A)
+                                          * (float)foc->torque_dir * POS_FF_DUTY_PER_A);
+                    LOGW("[POS] STICTION kick #%u: %.1fA for %ums (err=%.1fdeg, stalled %lums)\r\n",
+                         (unsigned)s_pos_kick_cnt, POS_KICK_A,
+                         (unsigned)(POS_KICK_TICKS / 20U),
+                         err, (unsigned long)(since_edge / 20U));
+                }
+
+                if (foc->tick < s_pos_brake_end && foc->hall.dir != 0) {
+                    /* 刚脱困: 强制全刹车(方向与刚走的方向相反), 停在下一个齿槽 */
+                    iq_target = -(float)foc->hall.dir * POS_DAMP_MAX_A;
+                } else if (kicking) {
+                    iq_target = (err > 0.0f) ? POS_KICK_A : -POS_KICK_A;
+                } else {
+                    /* ★ 10-11k 抖动抑制: 近目标且误差符号刚翻过 ⇒ 撤掉一切电流
+                       (位置读数分辨率只有半个扇区, 此时驱动就是自激振动的源) */
+                    if (fabsf(err) < POS_HOLD_BAND_DEG &&
+                        s_pos_err_flip_tick != 0U &&
+                        (foc->tick - s_pos_err_flip_tick) < POS_ERR_HYST_TICKS) {
+                        iq_target   = 0.0f;
+                        s_pos_integ = 0.0f;
+                    }
+                    /* ★★ 2026-10-11i 总输出按状态分档限幅:
+                       ① |v|<40(基本没动) ⇒ 允许 2.5A —— 这是掰开齿槽的**唯一**手段;
+                       ② 在动 & 电流与运动**同向**(驱动) ⇒ 只给 POS_IQ_RUN_A(1.6A),
+                          不让它"脱困后一路加速冲过头";
+                       ③ 在动 & 电流反向(刹车) ⇒ 允许 2.5A, 保证刹得住。 */
+                    float iq_lim = POS_IQ_CAP_A;
+                    if (fabsf(v) >= POS_INTEG_GATE_ERPM &&
+                        ((v > 0.0f && iq_target > 0.0f) ||
+                         (v < 0.0f && iq_target < 0.0f))) {
+                        iq_lim = POS_IQ_RUN_A;
+                    }
+                    if (iq_target >  iq_lim) iq_target =  iq_lim;
+                    if (iq_target < -iq_lim) iq_target = -iq_lim;
+                }
+            }
+        }
+    }
 
     /* ????? */
+    /* ★10-11k 兜底: 任何非有限/离谱的值都不许进电流环(实测日志出现过
+       Iqref=-637.50 的一瞬间 ⇒ 电流环立刻饱和、相电流冲到 9.5A 过流跳闸) */
+    if (!(iq_target >= -POS_IQ_CAP_A && iq_target <= POS_IQ_CAP_A)) {
+        iq_target = 0.0f;
+    }
     foc->current_loop.id_ref = 0.0f;
     foc->current_loop.iq_ref = iq_target;
 
@@ -1018,8 +1592,15 @@ static void FOC_UpdateCurrent(FOC_Control_t *foc)
     /* 方向修正放在指令侧(torque_dir×iq_ref), 反馈保持正常负反馈,
        电流环才稳定. (不能取负反馈, 会变正反馈→q电流跑飞过流) */
     {
-        float saved = foc->current_loop.iq_ref;
-        foc->current_loop.iq_ref = saved * (float)foc->torque_dir;
+        float saved  = foc->current_loop.iq_ref;
+        float iq_cmd = saved * (float)foc->torque_dir;
+        /* ★★ 2026-10-11k 兜底: 任何非有限/离谱的参考值都不许进电流环。
+           实测(10-11j 日志)出现过 Iqref=-637.50 的一瞬间 —— 电流环立刻饱和、
+           相电流冲到 9.5A、过流跳闸(du 从 0.52 直接跳到 0.797)。位置环自己
+           的限幅是 ±2.5A, 所以超过 8A 就说明数值/内存异常, 直接按 0 处理,
+           不让它变成真的 9.5A。 */
+        if (!(iq_cmd >= -8.0f && iq_cmd <= 8.0f)) iq_cmd = 0.0f;
+        foc->current_loop.iq_ref = iq_cmd;
         CurrentLoop_Update(&foc->current_loop, id, iq, 1.0f / foc->config.pwm_freq);
         foc->current_loop.iq_ref = saved;
     }
@@ -1058,9 +1639,40 @@ void FOC_Control_SetState(FOC_Control_t *foc, FOC_State_t state)
 void FOC_Control_SetPosTarget(FOC_Control_t *foc, float target_deg)
 {
     foc->pos_target_deg_cmd = target_deg;
+    foc->pos_target_user_set = 1U;   /* 即使还在 ALIGN/STARTUP 也要记住 */
+    /* 换目标 = 换一次"起步": 清掉上次顶静摩擦积下来的积分, 避免新方向
+       一开始就被旧积分顶着(表现为换了目标还先往老方向动一下) */
+    s_pos_integ = 0.0f;
+    /* 破黏脉冲也一并复位: 换目标后 400ms 就能打第一枪, 不用等冷却 */
+    s_pos_kick_end_tick  = 0U;
+    s_pos_kick_next_tick = 0U;
+    s_pos_kick_cnt       = 0U;
+    s_pos_err_run_tick   = 0U;
+    s_pos_blocked_logged = 0U;
+    s_pos_arm_tick       = 0U;
+    s_pos_kick_edge_tick = 0U;
+    s_pos_v_cmd          = 0.0f;   /* 规划器复位: 新目标从 0 开始加速 */
+    s_pos_a_cmd          = 0.0f;
+    s_pos_vdiff_tick     = 0U;     /* 位置差分测速重新起算 */
+    s_pos_esc_stalled    = 0U;
+    s_pos_brake_end      = 0U;
+    s_pos_err_sign       = 0;
+    s_pos_err_flip_tick  = 0U;
     if (foc->state == FOC_STATE_POSITION_LOOP) {
         PositionLoop_ResetArrived(&foc->position_loop);
     }
+}
+
+/* 位置环积分项(A) — 只给日志看, 判断"是不是靠积分顶着静摩擦" */
+float FOC_Control_GetPosIntegA(void)
+{
+    return s_pos_integ;
+}
+
+/* 位置环阻尼用的滤波速度(eRPM) — 只给日志看, 判断振荡/蠕动幅度 */
+float FOC_Control_GetPosErpm(void)
+{
+    return s_pos_erpm_filt;
 }
 
 void FOC_Control_SetSpeedRef(FOC_Control_t *foc, float ref_erpm)

@@ -18,6 +18,10 @@
 static FOC_Control_t g_foc;
 static uint8_t motor_pwm_off_logged = 0;
 
+/* 固件版本标签: 开机打一次, 并**每秒跟着 [ADCR] 打一次** —— 这样即使用户
+   只截取日志中段, 也能一眼看出跑的是哪个版本(反复吃过"烧的不是当前源码"的亏)。 */
+#define FW_BUILD_TAG  "2026-10-11k quiet-hold"
+
 /* ---- ????????? (RTT) ---- */
 #define ANGLE_LOG_MS   10U          /* 角度采样打印周期 (ms) */
 static uint32_t last_angle_print = 0;
@@ -254,6 +258,25 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         /* ??FOC??? (20kHz) - 零电流标定完成前不运行 */
         if (foc_loop_en) {
             float dt_s = 1.0f / 20000.0f;
+            /* 2026-10-01 ★每拍轮询霍尔引脚: hall.state 原来只在 EXTI 边沿里更新,
+               停机时没有边沿 ⇒ 它一直停在初值 0 ⇒ ALIGN 末尾读到 hall=0、
+               不标定 offset ⇒ 角度全错 ⇒ 位置环正反馈把电机抽飞(实测 Pos 跑到
+               -39616°)。这里 20kHz 直接读引脚(不碰 prev_state/edge_tick,
+               不影响边沿测速), 保证任何时刻 hall.state 都是真值。 */
+            {   /* 20kHz 直接读引脚: ① 保证任何时刻 hall.state 都是真值; ② 边沿
+                   检测也在这里做(不依赖 EXTI, 见 AngleObserver_PollHall)。 */
+                uint8_t hu = (uint8_t)HAL_GPIO_ReadPin(HALL_U_GPIO_Port, HALL_U_Pin);
+                uint8_t hv = (uint8_t)HAL_GPIO_ReadPin(HALL_V_GPIO_Port, HALL_V_Pin);
+                uint8_t hw = (uint8_t)HAL_GPIO_ReadPin(HALL_W_GPIO_Port, HALL_W_Pin);
+                uint8_t hs = (uint8_t)((~((hu << 2) | (hv << 1) | hw)) & 0x07);
+                g_foc.hall.u = hu;
+                g_foc.hall.v = hv;
+                g_foc.hall.w = hw;
+                (void)AngleObserver_PollHall(&g_foc.angle, &g_foc.hall, hs,
+                                             g_foc.tick,
+                                             g_foc.config.pwm_freq,
+                                             4.0f, 3000.0f, 1.5e-5f);
+            }
             FOC_Control_Run(&g_foc, dt_s);
         }
     }
@@ -264,24 +287,11 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
   */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-    uint8_t u, v, w;
-
+    /* 2026-10-11f: 霍尔边沿已改成 ADC 中断里 20kHz 轮询检测
+       (AngleObserver_PollHall) —— EXTI 这条路径**必须停用**, 否则同一个跳变
+       会被计两次(扇区序号一次加 2 = 位置整体跑掉)。
+       这里只清引脚/保留回调(由 HAL 清 EXTI pending 位)。 */
     (void)GPIO_Pin;
-
-    u = (uint8_t)HAL_GPIO_ReadPin(HALL_U_GPIO_Port, HALL_U_Pin);
-    v = (uint8_t)HAL_GPIO_ReadPin(HALL_V_GPIO_Port, HALL_V_Pin);
-    w = (uint8_t)HAL_GPIO_ReadPin(HALL_W_GPIO_Port, HALL_W_Pin);
-
-    g_foc.hall.u = u;
-    g_foc.hall.v = v;
-    g_foc.hall.w = w;
-    g_foc.hall.state = (uint8_t)((~((u << 2) | (v << 1) | w)) & 0x07);
-
-    /* ??????? */
-    AngleObserver_OnHallEdge(&g_foc.angle, &g_foc.hall,
-                             g_foc.tick,
-                             g_foc.config.pwm_freq,
-                             4U, 3000.0f, 1.5e-5f);
 }
 
 /* ---- printf??? ---- */
@@ -406,6 +416,27 @@ static void HallVerify_Poll(uint32_t now)
     }
 }
 
+/* ---- 一键启动: 不在闭环里(含 IDLE/FAULT)时自动做一次 "r" ----
+   2026-10-01: 原来在 IDLE 下按数字键只改目标、不启动, 实测用户按 '1'/'2' 后
+   电机完全没反应(日志: st 恒 0/IDLE, th 恒 0), 极易误判成算法坏了.
+   现在按数字键或 'z' 会自动清故障 + ALIGN + STARTUP, 按了就走;
+   已经在闭环(POSITION/SPEED/CURRENT)里则只改目标, 不重新对齐. */
+static void AutoStartIfIdle(void)
+{
+    if (g_foc.state == FOC_STATE_IDLE || g_foc.state == FOC_STATE_FAULT) {
+        g_foc.flags.fault   = 0;
+        g_foc.fault_code    = 0;
+        g_foc.flags.enabled = 1;
+        g_foc.align_tick    = 0;   /* 让 DoAlign 重新计时 */
+        g_foc.startup_tick  = 0;
+        /* 注意: 这里**不能**清 pos_target_user_set, 用户刚设的目标要保留 */
+        FOC_Control_SetState(&g_foc, FOC_STATE_ALIGN);
+        /* 字符串里不要放非 ASCII: ARMCC 会报 #870-D invalid multibyte sequence,
+           而且 RTT 终端上原样打出 `?????`(见历史日志) —— 用纯英文更清楚 */
+        LOGD("[CMD] auto-start -> ALIGN (or press 'r')\n");
+    }
+}
+
 int main(void)
 {
     FOC_Config_t config;
@@ -433,7 +464,7 @@ int main(void)
     LOGD("\r\n===== FOC Control System =====\r\n");
     LOGD("MCU: STM32G431RBT6, 170MHz\r\n");
     LOGD("PWM: 20kHz Center-Aligned\r\n");
-    LOGD("[FW] build 2026-09-27 manual-ol4 oc-guard\r\n");
+    LOGD("[FW] build %s\r\n", FW_BUILD_TAG);
 
     /* ---- ??FOC ---- */
     config.pwm_freq = 20000.0f;
@@ -477,6 +508,18 @@ int main(void)
 
     /* ???FOC?? */
     FOC_Control_Init(&g_foc, &config);
+
+    /* 关键标定值开机打印: 这个工程反复吃过"烧进去的不是当前源码"的亏(最近一次:
+       日志打出 vb=1.7V, 而源码里 vbus_divider=16.5 —— 1.7V 对应的分压比是 13.4,
+       说明烧的是老 hex)。有这行就能一眼确认烧的是哪一版、哪个分压比。 */
+    LOGD("[FW] vbus_div=%.1f vref=%.2f shunt=%.4fOhm gain=%.1f pp=%d dir_rev=%d align=%.1fA startup=%.1fA\r\n",
+         g_foc.config.vbus_divider, g_foc.config.vref, g_foc.config.shunt_r,
+         g_foc.config.op_gain, (int)g_foc.config.pole_pairs,
+         (int)g_foc.config.hall_dir_rev,
+         g_foc.config.align_current, g_foc.config.startup_current);
+    /* 母线采样自检: 这行在 PWM 启动前, 故它应该就是万用表量到的母线电压。
+       若相差数倍 ⇒ 分压网络/PA0 或"母线根本没到分压点"(同一节点也喂功率级,
+       所以这种断点会同时表现为"有占空比但相电流恒 0")。 */
 
     /* ---- ??PWM ---- */
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
@@ -537,7 +580,7 @@ int main(void)
          (int)g_foc.config.hall_dir_rev, (int)g_foc.torque_dir);
     LOGD("[MAIN] Keys: o=MANUAL  u/i=V+/-0.01  n/m=V+/-0.05  h/l=freq +/-1Hz  f=dir  t=stop\r\n");
     LOGD("[MAIN] Keys: s=auto V/f test  p=PWM smoke test  r=re-align  d=dir_rev  y=torque\r\n");
-    LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  z=target 0  0~9=digit*45deg  c=hall verify\r\n");
+    LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  z=target 0  0~9=digit*45deg(auto-start)  c=hall verify\r\n");
     LOGD("[ANG] idx,state,hall,synced,elec_deg,mech_deg,erpm\r\n");
     (void)g_log_seq;    /* [ANG] 已降为 LOGI(默认不打印), 序号不再被引用 */
 
@@ -634,11 +677,15 @@ int main(void)
                     g_foc.flags.enabled = 1;
                     g_foc.align_tick    = 0;   /* 让 DoAlign 重新计时 */
                     g_foc.startup_tick  = 0;
+                    /* 单独按 'r' = "原地重新对齐并保持" ⇒ 不带上一轮的目标;
+                       若在 r 之后再按数字键, 那个新目标不会被交接清掉。 */
+                    g_foc.pos_target_user_set = 0U;
                     FOC_Control_SetState(&g_foc, FOC_STATE_ALIGN);
-                    LOGD("[CMD] fault cleared -> ALIGN\n");
+                    LOGD("[CMD] fault cleared -> ALIGN (target reset to hold)\n");
                 } else if (ch == 'z' || ch == 'Z') {
                     FOC_Control_SetPosTarget(&g_foc, 0.0f);
                     LOGD("[CMD] Zero position\n");
+                    AutoStartIfIdle();
                 } else if (ch == 'j' || ch == 'J') {
                     /* 开环力矩探针: +Iq 脉冲, 测机械方向 */
                     FOC_Control_SetTorqueProbe(&g_foc, +2.5f, 600);
@@ -648,8 +695,18 @@ int main(void)
                 } else if (ch >= '0' && ch <= '9') {
                     /* ????:????????? */
                     float target = (float)(ch - '0') * 45.0f;
+                    float now_deg = AngleObserver_GetMechDeg(&g_foc.angle,
+                                                             g_foc.config.pole_pairs);
+                    float de = target - now_deg;
                     FOC_Control_SetPosTarget(&g_foc, target);
-                    LOGD("[CMD] Set target %.1fdeg\n", target);
+                    /* 把按键那一瞬的位置/误差一起打出来: 反复出现"按了没动"的疑问,
+                       其实多数是"已经在目标容差内" —— 位置环在 |err|<容差 时本来就
+                       故意撤力矩(靠静摩擦保持), 所以按同一个数字键不会有任何动作。 */
+                    LOGD("[CMD] Set target %.1fdeg | now=%.2f err=%.2f -> %s\r\n",
+                         target, now_deg, de,
+                         (fabsf(de) < g_foc.position_loop.arrive_tol_deg)
+                             ? "ALREADY at target (no motion)" : "moving");
+                    AutoStartIfIdle();   /* IDLE/FAULT 时按了就走, 不用先按 'r' */
                 }
             }
         }
@@ -662,7 +719,8 @@ int main(void)
             float vbus_v = Vbus_ReadVolts();
             last_adc_print = now;
             if (vbus_v >= 0.0f) g_foc.current.vbus = vbus_v;
-            LOGD("[ADCR] vbraw=%u vb=%.1fV | cntU=%u cntV=%u cntW=%u | offU=%u offV=%u offW=%u | Iu=%.2f Iv=%.2f Iw=%.2f | shunt=%.4f gain=%.1f\r\n",
+            LOGD("[ADCR] fw=%s vbraw=%u vb=%.1fV | cntU=%u cntV=%u cntW=%u | offU=%u offV=%u offW=%u | Iu=%.2f Iv=%.2f Iw=%.2f | shunt=%.4f gain=%.1f\r\n",
+                 FW_BUILD_TAG,
                  g_vbus_raw, vbus_v,
                  adc1_inj_val[0], adc2_inj_val[0], adc1_inj_val[1],
                  adc_offset_u, adc_offset_v, adc_offset_w,
@@ -727,16 +785,18 @@ int main(void)
         /* 日志节流: 到位/静止时 500ms 一条; 正在运动(pos_err 超差)时 100ms
            一条, 便于看清"动一下停一下"这类容差附近的行为, 又不会刷屏. */
         print_ms = (fabsf(g_foc.position_loop.pos_err_deg) >=
-                    g_foc.position_loop.arrive_tol_deg) ? 100U : 500U;
+                    g_foc.position_loop.arrive_tol_deg) ? 25U : 500U;
         if ((now - last_print) >= print_ms) {
             last_print = now;
-            LOGD("[MAIN] st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f I=%.2f\r\n",
+            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f\r\n",
+                 (unsigned long)now,
                  g_foc.state, g_foc.flags.fault, g_foc.fault_code,
                  (int)g_foc.hall.state,
                  (int)g_foc.position_loop.arrived,
                  AngleObserver_GetMechDeg(&g_foc.angle, g_foc.config.pole_pairs),
                  g_foc.pos_target_deg_cmd,
                  g_foc.position_loop.pos_err_deg,
+                 g_foc.angle.theta * 57.29577951f, /* 电流矢量用的电角度: 应随霍尔边沿 60° 跳变, 停转时冻结 */
                  g_foc.current_loop.id,       /* d 轴电流: 大 = 电流跑进 d 轴, 不出力矩 */
                  g_foc.current_loop.iq,
                  g_foc.current_loop.iq_ref * (float)g_foc.torque_dir,
@@ -747,7 +807,8 @@ int main(void)
                  PWM_Output_GetDu(&g_foc.pwm),/* 实际加到 U 相的占空比 */
                  g_foc.speed_loop.ref_erpm,
                  g_foc.speed_loop.erpm_now,   /* 速度环实际用的反馈(已低通) */
-                 g_foc.speed_loop.integ);
+                 FOC_Control_GetPosIntegA(),  /* 位置环积分(A): 大 = 正在顶静摩擦 */
+                 FOC_Control_GetPosErpm());   /* 位置环阻尼用速度(eRPM): 振荡幅度 */
         }
 
         /* ??RTT????????: ???? + ???? */

@@ -27,6 +27,8 @@ typedef struct {
     SVPWM_t pwm;
 
     float pos_target_deg_cmd;
+    uint8_t pos_target_user_set; /* 1 = 用户在本轮 ALIGN/STARTUP 期间设过目标,
+                                    交接时不要用 0 覆盖掉它 */
     float speed_ref_erpm_cmd;
     float iq_ref_cmd;
     int8_t torque_dir;           /* +1/-1: 抵消换相方向, 使 +Iq 指令→+机械角方向 */
@@ -99,6 +101,10 @@ void FOC_Control_SetState(FOC_Control_t *foc, FOC_State_t state);
 
 /* ---- 控制命令输入 ---- */
 void FOC_Control_SetPosTarget(FOC_Control_t *foc, float target_deg);
+/* 位置环积分项(A): 只用于日志/调试, 看"是不是靠积分顶着静摩擦" */
+float FOC_Control_GetPosIntegA(void);
+/* 位置环阻尼用的滤波速度(eRPM): 只用于日志/调试 */
+float FOC_Control_GetPosErpm(void);
 void FOC_Control_SetSpeedRef(FOC_Control_t *foc, float ref_erpm);
 void FOC_Control_SetIqRef(FOC_Control_t *foc, float iq_ref);
 void FOC_Control_SetTorqueProbe(FOC_Control_t *foc, float iq_A, uint32_t dur_ms);

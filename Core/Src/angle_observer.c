@@ -44,6 +44,48 @@ static float GetSectorCenter(uint8_t state, uint8_t dir_rev)
     return a;
 }
 
+/* =====================================================================
+ * 2026-10-11c: 位置计算改用"扇区序号 + 扇区内插值"的绝对算法
+ * ---------------------------------------------------------------------
+ * 旧做法: 把折叠后的 theta 每拍做 ±180° 相位展开后再累加(积分器)。
+ * 致命缺陷: 本机霍尔环序里存在**正好相差 180° 的对跖对**(h1↔h2, h3↔h4,
+ * h5↔h6 —— 表中中心角相差约 180°)。一旦漏掉一次边沿(EXTI 丢掉/受 PWM 干扰)
+ * 使状态一次跳 3 个扇区, “折叠角的前后差”就正好落在 ±180° 附近, 展开成了
+ * **猜正负号**: 猜错一次, 位置就整体偏 ±360° 电角度(= ±90° 机械角)且永不
+ * 恢复。2026-10-11 实测日志里同一个 (h=4, th=94.3) 一会儿 Pos=0.00 一会儿
+ * Pos=90.00(两者恰好差 90°机械 = 1 个电周期 360°电), 位置环于是一会儿正推
+ * 一会儿反推 ⇒ 在 0~105°(Tgt=90) 之间以 ±2.5A 剧烈来回摆。
+ * 新做法: 位置完全由当前(扇区, 扇区内进角)算出, 不再有任何积分器:
+ *     电角度 = 360°×圈数 + 本扇区入口角 + (adv + 半扇区宽)
+ * 圈数由一个**整型**计数器 sect_run(沿环序走过的扇区数)给出 —— 整型不漂、
+ * 多扇区跳变的个数由环序差直接得出(无需猜正负号)。
+ * ===================================================================== */
+
+/* 扇区在"电角度递增"方向上的环序序号(0..5)。
+   dir_rev=1 时递增顺序(按下面两表的入口边界角排):
+     h5(0.03°) → h1(54.97°) → h3(116.04°) → h2(176.23°) → h6(231.47°) → h4(298.10°)
+     ⇒ RING[h5]=0, RING[h1]=1, RING[h3]=2, RING[h2]=3, RING[h6]=4, RING[h4]=5.
+   dir_rev=0 时 theta 与扇区的对应镜像了 ⇒ 环序反向: 直接查下面第二张表。
+   ⚠ 环序必须沿"theta 递增"(而不是沿物理 FWD 链), 因为位置环的正方向就是
+   theta 增大的方向 —— 这样“位置增量”与“闭环命令正负”天然一致。 */
+static const uint8_t RING_REV1[8] = { 0U, 1U, 3U, 2U, 5U, 0U, 4U, 0U };
+static const uint8_t RING_REV0[8] = { 0U, 0U, 4U, 5U, 2U, 1U, 3U, 0U };
+
+static int32_t RingOfState(uint8_t h, uint8_t dir_rev)
+{
+    if (h < 1U || h > 6U) return 0;
+    return (int32_t)(dir_rev ? RING_REV1[h] : RING_REV0[h]);
+}
+
+/* 本扇区"入口边界"的绝对电角度(rad, 已含 dir_rev 镜像) */
+static float SectorEntryRad(uint8_t h, uint8_t dir_rev)
+{
+    float e = GetSectorCenter(h, dir_rev) - SECTOR_HALFWIDTH[h];
+    while (e < 0.0f)         e += 6.28318531f;
+    while (e >= 6.28318531f) e -= 6.28318531f;
+    return e;
+}
+
 /* ---- ??? ---- */
 void AngleObserver_Init(Angle_Observer_t *obs, float hall_offset_deg,
                         uint8_t hall_dir_rev)
@@ -51,6 +93,7 @@ void AngleObserver_Init(Angle_Observer_t *obs, float hall_offset_deg,
     obs->theta = 0.0f;
     obs->theta_base = 0.0f;
     obs->theta_halfwidth = 0.52359878f;
+    obs->adv = 0.0f;
     obs->omega = 0.0f;
     obs->omega_filt = 0.0f;
     obs->omega_prev = 0.0f;
@@ -68,6 +111,63 @@ void AngleObserver_Init(Angle_Observer_t *obs, float hall_offset_deg,
         obs->edge_hist_acc[i]  = 0.0f;
     }
     obs->edge_hist_idx = 0U;
+    obs->last_get_tick = 0U;
+    obs->sect_run    = 0;
+    obs->pos_abs_rad = 0.0f;
+    obs->pos_ref_rad = 0.0f;
+    obs->pos_seeded  = 0U;
+    obs->last_dir    = 0;
+    obs->bad_cnt     = 0U;
+}
+
+/* =====================================================================
+ * 2026-10-11f: 20kHz 轮询式霍尔边沿检测(取代 EXTI 触发)
+ * ---------------------------------------------------------------------
+ * 为什么换: 10-11d/e 日志里位置读数会整体跳 ±90°(机械) = ±1 个电周期,
+ * 而 90°机械 = 6 个扇区, 只可能来自"扇区序号一次少/多算 6" —— 即**漏掉了
+ * 边沿**(EXTI 丢中断/被高优先级 ISR 挤掉/PWM 干扰合并), 之后算法只能靠
+ * "猜方向"补, 猜错就是整整一个电周期(位置环于是正反猛推: ±60° 大摆 +
+ * ±2.5A 来回, 测速也被同源的假差分污染成 ±1300eRPM 尖刺)。
+ *
+ * 本函数由 20kHz 的 ADC 中断调用(那里本来就在读三个霍尔脚):
+ *  · 50µs 采样一次, 转子跨过 1 个扇区(15.5°机械)最快也要 ~200 个采样点
+ *    ⇒ **状态序列一定是相邻链**, 不可能跳过中间态;
+ *  · 所以"非相邻跳变"在物理上不可能(50µs 跨两个扇区 = 30 万°/s)
+ *    ⇒ 一律当**噪声丢弃**, 不去动位置;
+ *  · 两次接受的边沿间隔还要求 ≥ min_dt_ticks(4 拍 = 200µs, 同样物理上
+ *    不可能更快) ⇒ 接触抖动/干扰脉冲全滤掉。
+ * 这样扇区序号只会在确认的相邻跳变上 ±1, 结构上不可能再整圈漂。
+ * ⚠ EXTI 那条路径已停用(否则同一跳变会被计两次)。 */
+uint8_t AngleObserver_PollHall(Angle_Observer_t *obs, Hall_State_t *hall,
+                               uint8_t h_new, uint32_t now_tick, float pwm_freq,
+                               float min_dt_ticks, float omega_clamp_erpm,
+                               float alpha_max)
+{
+    uint8_t  prev = hall->prev_state;
+    uint32_t dt;
+
+    if (h_new < 1U || h_new > 6U) {        /* 0/7 非法态: 不接受边沿 */
+        return 0U;
+    }
+    if (h_new == hall->state) return 0U;   /* 没变化 */
+
+    dt = now_tick - hall->edge_tick;
+
+    if (prev >= 1U && prev <= 6U) {
+        if (!((h_new == FWD_NEXT[prev] || h_new == BWD_NEXT[prev]) &&
+              dt >= (uint32_t)min_dt_ticks)) {
+            /* 非相邻 / 太快 ⇒ 先当噪声, **不改 hall->state**(下次采样再判同一个
+               读数), 持续到 10ms 才认它(防干扰卡死位置) */
+            obs->bad_cnt++;
+            if (obs->bad_cnt < 200U) return 0U;
+        }
+    }
+
+    obs->bad_cnt  = 0U;
+    hall->state   = h_new;
+    AngleObserver_OnHallEdge(obs, hall, now_tick, pwm_freq,
+                             min_dt_ticks, omega_clamp_erpm, alpha_max);
+    return 1U;
 }
 
 /* ---- ????????? ---- */
@@ -89,14 +189,45 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
     if (hall->prev_state >= 1 && hall->prev_state <= 6) {
         if (h == FWD_NEXT[hall->prev_state]) {
             dir = 1;
+            obs->last_dir = 1;          /* 相邻跳变确认方向(供对跖情况用) */
         } else if (h == BWD_NEXT[hall->prev_state]) {
             dir = -1;
+            obs->last_dir = -1;
         } else {
-            /* 非相邻跳变(丢步/多步): 沿用上一次的转动方向 */
-            dir = (obs->omega >= 0.0f) ? 1 : -1;
+            /* 非相邻跳变(丢步/多步): 沿用上一次确认过的方向; 没记录过才退回 omega 符号 */
+            dir = (obs->last_dir != 0) ? obs->last_dir
+                                       : ((obs->omega >= 0.0f) ? 1 : -1);
         }
     } else {
         dir = 1;
+    }
+
+    /* ---- 扇区序号累加(2026-10-11c, 位置算法的核心) ----
+       位置不再靠“折叠角积分”, 而是“整型扇区序号 + 扇区内进角”, 所以这里
+       必须把“跨了几个扇区、往哪边”记准: 相邻跳变的方向由 FWD/BWD 表直接
+       给出; 非相邻跳变(漏边沿/受干扰)用 omega 的符号定方向, 再按环序取该
+       方向的步数 —— 180° 的对跖跳变必须由方向定, 不能靠 ±180° 就近展开
+       (那正是 2026-10-11 实测“位置整搬 90°”的根源)。 */
+    if (obs->pos_seeded == 0U) {
+        obs->sect_run  = RingOfState(h, obs->hall_dir_rev);
+        obs->pos_seeded = 1U;
+    } else if (hall->prev_state >= 1U && hall->prev_state <= 6U) {
+        int32_t r0 = RingOfState(hall->prev_state, obs->hall_dir_rev);
+        int32_t r1 = RingOfState(h, obs->hall_dir_rev);
+        int32_t d  = r1 - r0;
+        /* ★ 步数取"环序最短路径"(±3 以内) —— 绝不能用 dir 去强行定符号:
+           dir 在非相邻跳变时只能猜(omega/上一次方向), 猜错会把 2 步变成 -4 步
+           (= 整整 6 个扇区 = ±90° 机械角的位置大跳)。最短路径则是确定的:
+             漏 1 条边(跳 2 扇区) → |d|=2 ✓ 唯一
+             漏 2 条边(跳 3 扇区) → |d|=3（正好对跖, 两种方向等价于 ±3）
+           ⇒ 只有 |d|==3 这种对跖情况才必须靠方向决断, 用上一次**相邻**跳变
+              确认过的方向(last_dir) —— 比瞬时 omega 可靠得多。 */
+        if (d >  3) d -= 6;
+        if (d < -3) d += 6;
+        if (d == 3 || d == -3) {
+            d = (obs->last_dir >= 0) ? 3 : -3;
+        }
+        obs->sect_run += d;
     }
 
     dt = now_tick - hall->edge_tick;
@@ -106,7 +237,13 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
         obs->glitch_cnt++;
         obs->theta_base = GetSectorCenter(h, obs->hall_dir_rev);
         obs->theta_halfwidth = SECTOR_HALFWIDTH[h];
+        obs->adv = -(float)dir * obs->theta_halfwidth;
         hall->dir = dir;
+        /* ⚠ 2026-10-11c: 这里必须更新 prev_state。原来不更新 ⇒ 下一次边沿
+           拿“两条边沿前”的旧状态去算方向, 得到“非相邻”→ dir 只能猜, 且
+           上一次边沿造成的扇区序号变化会算错(位置多跳/少跳一个扇区).
+           edge_tick 仍不更新(抖时间仍按真实边沿算, 测速不受影响)。 */
+        hall->prev_state = h;
         return;
     }
 
@@ -130,16 +267,24 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
             uint32_t t0 = obs->edge_hist_tick[obs->edge_hist_idx]; /* 最旧一条 */
             float    a0 = obs->edge_hist_acc[obs->edge_hist_idx];
             float    dacc = obs->elec_acc_deg - a0;
-            /* 只有 elec_acc_deg 确实在推进时才采用窗口估计。
-               ALIGN/STARTUP/手动开环期间 GetTheta 不被调用(FOC_DoAlign /
-               FOC_DoStartup 直接调 FOC_UpdateCurrent), 于是 elec_acc_deg 被冻结
-               → dacc==0 → omega 被算成 0 → omega_filt 衰减到 0 →
-               GetOmegaFiltErpm()==0 → STARTUP 的同步判据 |erpm|>8 永远不成立。
-               实测现象: 霍尔明明在跳(转子被拖动了), 却每次都
-               [STARTUP] Timeout, hall not synced → FAULT 0x0002。
-               此时保留上面的单边沿估计(扇区宽/dt)。 */
-            if (t0 != 0U && now_tick > t0 &&
-                (dacc > 0.01f || dacc < -0.01f)) {
+            /* 判据: GetTheta 最近(1ms 内)真的在跑 ⇒ 窗口测速可信。
+               2026-10-01 改动(★解决到位后的嗡嗡振动): 原判据是"dacc 必须
+               非零", 本意是防 ALIGN/STARTUP 期间 elec_acc_deg 冻结。 但在闭环
+               里转子停在霍尔边界上时 dacc 也恰好 ≈0(来回掉), 于是窗口估计
+               被跳过、保留了**单边沿**估计 sector_width/dt —— 边沿一密就
+               变成 ±200~3000eRPM 的尖刺。 该尖刺乘 kd(0.006) 就是 ±1.5A
+               的抖动电流, 真的把机构摇起来, 而位置反馈又因 adv 限幅而
+               "看不见"这个抖动 ⇒ **自激嗡嗡声**(实测到位后 err=0 但
+               Iqref 在 ±1.7A 来回、vsp=±250)。
+               改用 last_get_tick 判"GetTheta 是否在跑": 闭环里永远用窗口
+               估计(转子真不动时 dacc≈0 ⇒ omega≈0 ⇒ 不注入噪声);
+               ALIGN/STARTUP 期还退出单边沿估计 ⇒ 同步判据不受影响。 */
+            /* ⚠ 2026-10-11g: 加 dt >= 1000(50ms) 条件 —— 只在\"慢\"的时候用窗口平均.
+               窗口跨 3 个扇区(~45°机械), 高速/加速时严重滞后(实测转子 674°/s 而
+               上报 84eRPM, 差 8 倍 ⇒ 环路继续正推 ⇒ 冲过目标 15~80°). 快的时候
+               用上面的单边沿估计(只滞后 1 个扇区), 慢的时候才用窗口平滑。 */
+            if (t0 != 0U && now_tick > t0 && dt >= 1000U &&
+                (now_tick - obs->last_get_tick) < 400U) {
                 obs->omega = dacc * 0.01745329f / (float)(now_tick - t0);
             }
             /* t0==0 → 历史还没填满(刚同步/刚交接), 保留上面的单边沿估计 */
@@ -158,7 +303,23 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
         obs->omega_prev = obs->omega;
 
         /* ---- ?????? ---- */
-        obs->omega_filt = 0.5f * obs->omega_filt + 0.5f * obs->omega;
+        /* ---- ★★ 2026-10-11j: 长时间没边沿(堵转/极慢)之后的**第一条**边沿, 不
+           能用"含堵转时间段的窗口"去平均测速。
+           实测(10-11i 日志): 卡在齿槽里 400ms 后一脱困, 窗口跨的那一段大部分
+           是"停着不动", dacc/Δt 被拉低到几十分之一 —— 环路以为 "vsp=-14eRPM
+           几乎没动", 于是继续用 1.87A 猛推, 一路推 40~46° 才看到高速去反拉。
+           所以: 把这些历史清掉, ω_filt 直接取本次单边沿实测值(不用旧值平均),
+           下一条边沿起才恢复窗口平滑。 */
+        if (dt > 1000U) {
+            for (int i = 0; i < 4; i++) {
+                obs->edge_hist_tick[i] = 0U;
+                obs->edge_hist_acc[i]  = 0.0f;
+            }
+            obs->edge_hist_idx = 0U;
+            obs->omega_filt = obs->omega;          /* 不用陈旧值平均 */
+        } else {
+            obs->omega_filt = 0.5f * obs->omega_filt + 0.5f * obs->omega;
+        }
         obs->synced = 1;
     }
 
@@ -169,61 +330,118 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
     hall->dir = dir;
     obs->theta_base = GetSectorCenter(h, obs->hall_dir_rev);
     obs->theta_halfwidth = SECTOR_HALFWIDTH[h];
+    /* 刚进入(h 为当前)扇区 ⇒ 进角重置到入口边界(+1 入时在入口下边界, -1 入时
+       在入口上边界). 因为相邻扇区的边界角度是相等的(扇区表按此构造), 这一步
+       不会给 theta 带来跳变 ⇒ 位置读数在边界处连续。 */
+    obs->adv = -(float)dir * obs->theta_halfwidth;
 }
 
 /* ---- ?????? (?PWM????) ---- */
+/* 无新边沿时模型速度的衰减时间常数(秒): 2026-10-11h 新增, 见 GetTheta 内注释。
+   ★ 2026-10-11k 0.15→0.08: 实测交接点后模型还带着 I-F 拖转的速度(189eRPM)
+   继续"爬"了 9.4°机械(= 0.6 个扇区)才停, 而转子其实早就被摩擦停住了
+   (减速约 290°/s², 200ms 就停) ⇒ 位置读数过量最多达半个扇区, 位置环
+   于是以为"还差 15°"去反推一个本来就到位的转子 —— 顶在齿槽壁上持续
+   振动, 顶久了还会塴出去。缩短到 80ms 后过量 ≤ v×0.08s(≈2~4°), 
+   而真在慢速爬行时每条边沿都会把它重置, 不受影响。 */
+#define POS_MODEL_TAU_S   0.08f
+
 float AngleObserver_GetTheta(Angle_Observer_t *obs, const Hall_State_t *hall,
                              uint32_t now_tick, float pwm_freq,
                              uint32_t timeout_ticks, float creep_hz,
                              uint8_t creep_suppress, float *erpm_out)
 {
     uint32_t dt = now_tick - hall->edge_tick;
-    float adv;
+    float dt_s = (dt > 0U) ? ((float)dt / pwm_freq) : 0.0f;
     float theta_out;
     float erpm = 0.0f;
+    uint8_t live = (obs->synced && dt < timeout_ticks) ? 1U : 0U;
 
-    /* ---- ???? (??) ---- */
-    if (!obs->synced || dt >= timeout_ticks) {
+    /* ==== 扇区内进角估计: 逐步累加, 不在超时/停转时塌缩到扇区入口 ====
+       2026-10-01 v3 重写. 旧实现是 adv = omega*dt - dir*hw(用 dt 重算),
+       带来两个致命副作用:
+        (1) 停转时 omega 衰减到 0 ⇒ adv 塔缩到 -dir*hw(扇区入口边界) ⇒
+            扇区内位置信息全部丢失, 位置读数被量化到 15°机械的格点上;
+            若目标不在格点上, 闭环永远进不了容差。
+        (2) 上一次为了防"卡死"又把 adv 限幅成 ±0.5×hw, 结果破坏了"相邻扇区
+            边界角度相等"这个连续性 —— 转子停在边界上时霍尔抖动, 读数在
+            两个相邻扇区之间跳 ±7.5°机械, 误差正负交替 ⇒ 电流 ±0.9A 来回
+            推 ⇒ 永久限幅环(实测: Tgt=0 时 h 在 4/5 之间抖, Pos 在 -7.74/
+            +7.31 之间跳, err 永远 7.3~7.7°, arr 永远 0; Tgt=45/90 同样,
+            因为 45/90 都是 15°的整数倍 ⇒ 正好落在霍尔边界上)。
+       现在: obs->adv 在每次霍尔边沿重置为 -dir*hw(入口边界, 与相邻扇区
+       边界角度相等 ⇒ 连续), 之后每拍 adv += omega_filt/pwm_freq 并限幅到
+       ±hw.
+        · 停转/超时: adv 保持不动 ⇒ 保留扇区内真实位置 ⇒ 读数连续、准确
+          (不再塌缩到格点);
+        · 边界抖动: 正向抖动进新扇区 adv=-hw, 反向抖动回旧扇区 adv=+hw,
+          两者算出的 theta 都是同一条边界 ⇒ 读数不跳 ⇒ 无限幅环;
+        · 不会卡死: 磁平衡点 θc=θest+90° = 真实位置+90°(±60°电误差),
+          sin 始终 ≥0.5 且指向正方向 ⇒ 必然越过霍尔边界。
+       物理上限: 自上次边沿起过了 dt 还没跳边沿 ⇒ 平均速度不可能超过
+       1.5 个扇区宽/dt; 用它限制 omega_filt, 停转时 adv 自然不会继续冲。 */
+    if (!live) {
         obs->omega = 0.0f;
         obs->omega_filt = 0.0f;
         obs->alpha_filt = 0.0f;
-
         if (!creep_suppress) {
             float creep_step = 2.0f * 3.14159265f * creep_hz / pwm_freq;
-            obs->theta += (float)hall->dir * creep_step;
+            obs->adv += (float)hall->dir * creep_step;
         }
-        theta_out = obs->theta;
-        goto wrap_and_exit;
+    } else {
+        float w = obs->omega_filt;
+        if (dt_s > 1.0e-6f) {
+            /* ⚠ 单位: omega/omega_filt 的单位是 rad 每 tick(见 OnHallEdge 的
+               `omega = sector_width/dt_ticks`, 以及那里的
+               `omega_clamp = erpm*2π/60/pwm_freq`) ⇒ "rad/s"的物理上限
+               要再 /pwm_freq 才换算成 rad/tick。
+               原来漏了这个 /pwm_freq(20000) ⇒ 限幅永不生效 ⇒ 停转后 w 一直
+               保持上一次边沿的旧值(实测卡住时 vsp 冻在 136eRPM 长达 0.7s),
+               于是阻尼项 -kd*vsp 把 P 项正好抵消 ⇒ Iqref 只剩 -0.01A, 转子
+               推不动, 要等 1s 超时(live=0)才恢复; kd 调得越大这个假速度
+               吃掉的力越多。 */
+            /* 速度物理上限: 自上一条霍尔边沿已过 dt 仍未跳边沿 ⇒ 平均速度不可能
+               超过(半扇区宽×系数)/dt。系数由 3.0 降到 1.0(2026-10-09h):
+               卡在齿槽里(400ms 没边沿、转子确实没动)时, 残留 omega_filt 只按
+               1/dt 缓慢衰减, 实测还有 40~90eRPM ⇒ ① 位置环积分门控(|v|<40)
+               一直不打开 ⇒ Ipos 恒 0, 只剩 P 的 0.6A, 推不出齿槽、只能等破黏;
+               ② 更早以前还会经阻尼抵消 P 项。系数 1.0 后 dt=150ms 就降到 <40eRPM,
+               积分门控能自己打开。只在"停转"区间收紧, 正常运转(dt 小)不受影响。 */
+            float wmax = 2.0f * obs->theta_halfwidth / (dt_s * pwm_freq);
+            if (w >  wmax) w =  wmax;
+            if (w < -wmax) w = -wmax;
+            /* ★★ 2026-10-11h: 无新边沿时把"模型速度"指数衰减(τ≈150ms)。
+               实测(10-11g 日志): 转子其实已卡在齿槽里不动, 但 adv 以"上一次测到
+               的速度"一直往前爬 —— 230ms 里位置读数虚假前爬 **9.2°(=41°/s 恒定)**,
+               超过容差 6° ⇒ 环路误判误差(-6°→-15°)、还误触发破黏脉冲 ⇒ 变成
+               "卡住→踢→飞 46°→再卡"的极限环。
+               物理依据: 一直没有新边沿, 本身就说明转子在减速或停了(若真按上次
+               速度继续走, 早就跳边沿了)。所以让模型速度衰减: 卡住时位置最多再
+               爬 v_last×0.15s(≈4°, 小于容差), 不会跑掉一整个扇区; 真在运动时,
+               每个边沿都会把它重置回实测值, 完全不受影响。 */
+            {
+                float tau_ticks = POS_MODEL_TAU_S * pwm_freq;
+                if (tau_ticks > 1.0f) w *= (1.0f - 1.0f / tau_ticks);
+            }
+        }
+        /* 同单位 bug: w 是 rad/tick, 每拍就应 += w(原来 += w/pwm_freq, 小 20000
+           倍) ⇒ adv 实际上钉在扇区入口边界不动 ⇒ **位置读数被量化到扇区
+           边界**(实测 Pos 反复只出现 44.48/59.53/73.34/105.48 这类格点值,
+           目标 45/90 恰好落在格点上所以能到位, 但看到的"过冲 15°"其实主要是
+           越过边界后读数跳到下一个格点, 不是真的冲了 15°)。 */
+        obs->adv += w;
+        /* 2026-10-01: 上报速度也用**限幅后**的 w。 原来用 obs->omega, 它在
+           两个边沿之间是"冻结"的旧值 ⇒ 停转后 dt 越拉越长、物理上不可能
+           还保持那个速度, 但 vsp 会一直显示旧值(实测停在 404 不动), 
+           而阻尼项 -kd*vsp 就白推了 ±1A 的电流。 */
+        erpm = w * pwm_freq / 6.28318531f * 60.0f;
     }
 
-    /* ---- 速度估计随时间衰减(关键) ----
-       obs->omega 只在霍尔边沿更新一次, 之后会被一直"保持"到 1 秒 timeout.
-       实测: 转子一次窜动(5ms 冲过 1 个扇区 ≈2000eRPM)后停住, fb 仍恒定
-       1948/2019 长达 300~600ms → 速度环以为在飞车, 积分以 ki*|err|≈400/s
-       打到反向满幅 → 满力矩反拉 → 转子反向冲 → 再反拉 … 表现为"很快的
-       左右摆动, 然后停止, 又重复".
-       物理上限: 自上次边沿起已经过了 dt 拍还没出现新边沿 ⇒ 这段时间的平均
-       速度不可能超过 (一个扇区宽)/dt. 停转时该上限按 1/dt 收敛到 0, 估计值
-       自然衰减; 正常转动时 dt≈边沿间隔, 上限≈实测值(留 1.2 倍余量给抖动). */
-    if (dt > 0U && obs->theta_halfwidth > 0.0f) {
-        float omega_cap = 1.2f * 2.0f * obs->theta_halfwidth / (float)dt;
-        if (obs->omega >  omega_cap) obs->omega =  omega_cap;
-        if (obs->omega < -omega_cap) obs->omega = -omega_cap;
-    }
+    if (obs->adv >  obs->theta_halfwidth) obs->adv =  obs->theta_halfwidth;
+    if (obs->adv < -obs->theta_halfwidth) obs->adv = -obs->theta_halfwidth;
 
-    /* ---- ???? ---- */
-    adv = obs->omega_filt * (float)dt
-        + 0.5f * obs->alpha_filt * (float)dt * (float)dt
-        - (float)hall->dir * obs->theta_halfwidth;
+    theta_out = obs->theta_base + obs->adv + obs->offset;
 
-    if (adv >  obs->theta_halfwidth) adv =  obs->theta_halfwidth;
-    if (adv < -obs->theta_halfwidth) adv = -obs->theta_halfwidth;
-
-    theta_out = obs->theta_base + adv + obs->offset;
-
-    erpm = obs->omega * pwm_freq / 6.28318531f * 60.0f;
-
-wrap_and_exit:
     /* ---- 折叠到 0~2π ---- */
     while (theta_out >= 6.28318531f) theta_out -= 6.28318531f;
     while (theta_out < 0.0f)         theta_out += 6.28318531f;
@@ -239,13 +457,29 @@ wrap_and_exit:
        (本机 26 极对 = 13.85°). 位置环把它当成"走过头了" → 反向猛推 →
        转子每转一个电周期就来回摇摆一次(实测 ~1s 一摇, 正对应"一动一停").
        霍尔在扇区边界抖动时 theta 的 ±60° 跳变正反对称, 净累加为 0, 不漂移. */
-    {
-        float d = theta_out - obs->theta;
-        if (d >  3.14159265f) d -= 6.28318531f;
-        if (d < -3.14159265f) d += 6.28318531f;
-        obs->elec_acc_deg += d * 57.29577951f;
+    {   /* ---- 位置: 由 (扇区序号, 扇区内进角) 直接算出, 不做积分 ----
+           2026-10-11c 重写(原因见 RingOfState 上方的长注释): 不再对折叠后的
+           theta 做 ±180° 展开累加 —— 对跖扇区(h1↔h2, h3↔h4, h5↔h6 相差
+           180°)被漏掉一次边沿时那一步展开就会猜错符号, 位置整体偏 ±360°电
+           (±90°机械)且永不恢复, 闭环于是正推/反推交替 = 剧烈来回摆。
+           现在位置 = 360°×圈数(sect_run 整型推算) + 本扇区入口角 +
+           (adv + 半扇区宽), 完全由当前状态决定, 没有可漂的积分器;
+           多扇区跳变按环序差一步到位(不需猜符号, 方向由 dir 给出)。 */
+        uint8_t hs = hall->state;
+        if (hs >= 1U && hs <= 6U && obs->pos_seeded != 0U) {
+            int32_t r    = RingOfState(hs, obs->hall_dir_rev);
+            float   local = obs->adv + SECTOR_HALFWIDTH[hs];        /* 0 .. 2hw */
+            float   entry = SectorEntryRad(hs, obs->hall_dir_rev);
+            /* 圈数用 (sect_run - r)/6 算: sect_run ≡ r (mod 6) 由构造保证,
+               所以这个差恰好是 6 的整数倍(不会出现除不尽的情况) */
+            float pos_abs = 6.28318531f * (float)((obs->sect_run - r) / 6)
+                            + entry + local;
+            obs->pos_abs_rad  = pos_abs;
+            obs->elec_acc_deg = (pos_abs - obs->pos_ref_rad) * 57.29577951f;
+        }
     }
     obs->theta = theta_out;
+    obs->last_get_tick = now_tick;   /* 标记"GetTheta 在跑", 供窗口测速判据用 */
 
     if (erpm_out != NULL) *erpm_out = erpm;
     return theta_out;
@@ -269,6 +503,16 @@ float AngleObserver_GetMechDeg(const Angle_Observer_t *obs, float pole_pairs)
 {
     if (pole_pairs <= 0.0f) pole_pairs = 1.0f;
     return obs->elec_acc_deg / pole_pairs;
+}
+
+/* ---- 把当前位置定为 0(交接用) ----
+   2026-10-11c: 位置不再是“可累加的积分器”, 而是由 (扇区, 进角) 算出的绝对值,
+   所以“清零”= 把参考点搬到当前位置(不能再去写 elec_acc_deg, 那样下一拍就被
+   覆盖)。 */
+void AngleObserver_ZeroPos(Angle_Observer_t *obs)
+{
+    obs->pos_ref_rad  = obs->pos_abs_rad;
+    obs->elec_acc_deg = 0.0f;
 }
 
 /* ---- 用对齐结果自动校正霍尔表零点 ----

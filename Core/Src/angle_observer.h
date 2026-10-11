@@ -17,6 +17,14 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
                               float min_dt_ticks, float omega_clamp_erpm,
                               float alpha_max);
 
+/* ---- 20kHz 轮询式边沿检测(2026-10-11f, 推荐入口) ----
+   由 ADC 中断每拍调用, 传当前读到的霍尔状态 h_new; 内部做"相邻性+最小间隔"
+   校验, 非法(噪声/抖动)直接丢弃。返回 1 = 本次接受了一次边沿。 */
+uint8_t AngleObserver_PollHall(Angle_Observer_t *obs, Hall_State_t *hall,
+                               uint8_t h_new, uint32_t now_tick, float pwm_freq,
+                               float min_dt_ticks, float omega_clamp_erpm,
+                               float alpha_max);
+
 /* ---- ??????:???PWM???? ---- */
 float AngleObserver_GetTheta(Angle_Observer_t *obs, const Hall_State_t *hall,
                              uint32_t now_tick, float pwm_freq,
@@ -31,6 +39,11 @@ float AngleObserver_GetOmegaFiltErpm(const Angle_Observer_t *obs, float pwm_freq
 
 /* ---- ??机械角度 (deg, 多圈累加) ---- */
 float AngleObserver_GetMechDeg(const Angle_Observer_t *obs, float pole_pairs);
+
+/* ---- 把当前位置定为 0(ALIGN/STARTUP 交接时用) ----
+   2026-10-11c: 位置已改为绝对值算法, 清零必须搬参考点而不能直接写
+   elec_acc_deg(那会在下一拍被覆盖)。 */
+void AngleObserver_ZeroPos(Angle_Observer_t *obs);
 
 /* ---- 用对齐结果自动校正霍尔表零点 ----
    对齐阶段 theta 被强制到已知电角度(0°), 此刻转子 d 轴就停在该角度上; 读当时的

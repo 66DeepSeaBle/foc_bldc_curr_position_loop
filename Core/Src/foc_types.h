@@ -59,6 +59,10 @@ typedef struct {
     float theta;                 // ????? (??, 0~2p)
     float theta_base;            // ????????
     float theta_halfwidth;       // ?????? (??)
+    /* 扇区内进角估计(rad, ∈[-halfwidth,+halfwidth]): 每次霍尔边沿重置到该扇区
+       的入口边界, 之后按速度逐步累加。它是"逐步累加"而不是"用 dt 重算",
+       所以停转时保持不动(不再往入口边界塌缩), 位置读数在扇区边界也连续。 */
+    float adv;
     float omega;                 // ??? (rad/tick)
     float omega_filt;            // ????? (rad/tick)
     float omega_prev;            // ????? (?????)
@@ -77,6 +81,25 @@ typedef struct {
     uint32_t edge_hist_tick[4];
     float    edge_hist_acc[4];
     uint8_t  edge_hist_idx;
+    /* GetTheta 最后一次被调用的时刻: 用它判断 elec_acc_deg 是否"正在推进"。
+       ALIGN/STARTUP 期间 GetTheta 不被调用 ⇒ elec_acc_deg 冻结 ⇒ 窗口测速
+       没意义(必须退回单边沿估计, 否则 STARTUP 同步判据永远不成立)。 */
+    uint32_t last_get_tick;
+
+    /* ---- 2026-10-11c: 位置改成"扇区序号 + 扇区内插值"的绝对算法 ----
+       sect_run   : 沿正向环序累计走过的扇区数(整型, 只在边沿更新, 不会漂)
+       pos_abs_rad: 当前绝对电角度 = 360°×圈数 + 扇区入口角 + 扇区内进角
+       pos_ref_rad: 位置零点(交接时对齐, 使 elec_acc_deg = 0)
+       pos_seeded : 第一条边沿时把 sect_run 对齐到当前扇区 */
+    int32_t  sect_run;
+    float    pos_abs_rad;
+    float    pos_ref_rad;
+    uint8_t  pos_seeded;
+    /* 上一次"相邻跳变"确认过的转动方向(±1, 0=未知): 对跖(180°)跳变时用它
+       决断步数符号, 比瞬时 omega 可靠 */
+    int8_t   last_dir;
+    /* 20kHz 轮询边沿检测用: 连续多少次采样拿到"非相邻状态"(噪声计数) */
+    uint16_t bad_cnt;
 } Angle_Observer_t;
 
 /* ---- PID??? ---- */
