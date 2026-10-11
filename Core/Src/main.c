@@ -20,7 +20,7 @@ static uint8_t motor_pwm_off_logged = 0;
 
 /* 固件版本标签: 开机打一次, 并**每秒跟着 [ADCR] 打一次** —— 这样即使用户
    只截取日志中段, 也能一眼看出跑的是哪个版本(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-11k quiet-hold"
+#define FW_BUILD_TAG  "2026-10-11o adv-writeback"
 
 /* ---- ????????? (RTT) ---- */
 #define ANGLE_LOG_MS   10U          /* 角度采样打印周期 (ms) */
@@ -443,6 +443,11 @@ int main(void)
     uint32_t last_print = 0;
     uint32_t last_adc_print = 0;
     uint32_t last_ol_print = 0;
+    /* 2026-10-11l 日志降噪用: 上一条 [MAIN] 的内容 + verbose 开关 */
+    float    last_mech = 1.0e9f;
+    float    last_tgt  = 1.0e9f;
+    uint8_t  last_hall = 0U;
+    uint8_t  log_verbose = 0U;
 
     HAL_Init();
     SystemClock_Config();
@@ -581,6 +586,7 @@ int main(void)
     LOGD("[MAIN] Keys: o=MANUAL  u/i=V+/-0.01  n/m=V+/-0.05  h/l=freq +/-1Hz  f=dir  t=stop\r\n");
     LOGD("[MAIN] Keys: s=auto V/f test  p=PWM smoke test  r=re-align  d=dir_rev  y=torque\r\n");
     LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  z=target 0  0~9=digit*45deg(auto-start)  c=hall verify\r\n");
+    LOGD("[MAIN] Keys: v=verbose log(25ms/line, default 500ms idle / 100ms moving)\r\n");
     LOGD("[ANG] idx,state,hall,synced,elec_deg,mech_deg,erpm\r\n");
     (void)g_log_seq;    /* [ANG] 已降为 LOGI(默认不打印), 序号不再被引用 */
 
@@ -621,12 +627,27 @@ int main(void)
 
         /* RTT 键盘 */
         while ((ch = SEGGER_RTT_GetKey()) >= 0) {
+            /* ★ 2026-10-11l: 每个收到的字符都回显一行。
+               反复出现"按了没反应"的困惑: 有了这行就能一眼分清
+               ①主机根本没把按键送进来(没有 [KEY] 行) ⇔
+               ②收到了但控制没动([KEY] 有, 后面的 [CMD]/[MAIN] 不动)。 */
+            LOGD("[KEY] '%c' (0x%02X) st=%d flt=%d\r\n",
+                 (ch >= 32 && ch < 127) ? ch : '.', (unsigned)ch,
+                 (int)g_foc.state, (int)g_foc.flags.fault);
             if (hall_verify_mode) {
                 if (ch == 'q' || ch == 'Q') HallVerify_Exit();
             } else {
                 if (ch == 'c' || ch == 'C') {
-                    HallVerify_Enter();
-                } else if (ch == 'd' || ch == 'D') {
+                    HallVerify_Enter();                } else if (ch == 'v' || ch == 'V') {
+                    /* 2026-10-11l: 详细日志开关。默认 500ms/条(不动)或 100ms/条
+                       (在动); 按 v 切成 25ms/条(看细节用), 再按一下关。
+                       原因: 堵转时 err 一直超差 ⇒ 25ms 一条 = 每秒 9KB,
+                       RTT 上行缓冲写满后 NO_BLOCK_SKIP 会丢掉日志,
+                       用户看到的 [CMD]/[KEY] 回显也可能被挤掉。 */
+                    log_verbose = log_verbose ? 0U : 1U;
+                    LOGD("[CMD] verbose log %s (%ums/line)\r\n",
+                         log_verbose ? "ON" : "OFF",
+                         log_verbose ? 25U : 500U);                } else if (ch == 'd' || ch == 'D') {
                     /* 运行时翻转霍尔方向(dir_rev), 用于判断闭环换相是否反向 */
                     g_foc.angle.hall_dir_rev = g_foc.angle.hall_dir_rev ? 0 : 1;
                     g_foc.config.hall_dir_rev = g_foc.angle.hall_dir_rev;
@@ -715,7 +736,7 @@ int main(void)
            核对电流采样量纲: I = -(cnt-offset)*Vref/(4095)/(shunt_r*op_gain).
            例: 若 cnt 只比 offset 高 ~100 而代码显示 1.5A, 说明 shunt_r 写小了
            (实际电阻更小/没有外部分流), 实际电流远小于显示值 → 空载也不转. */
-        if ((now - last_adc_print) >= 1000U) {
+        if ((now - last_adc_print) >= (log_verbose ? 1000U : 5000U)) {
             float vbus_v = Vbus_ReadVolts();
             last_adc_print = now;
             if (vbus_v >= 0.0f) g_foc.current.vbus = vbus_v;
@@ -782,13 +803,29 @@ int main(void)
             continue;
         }
 
-        /* 日志节流: 到位/静止时 500ms 一条; 正在运动(pos_err 超差)时 100ms
-           一条, 便于看清"动一下停一下"这类容差附近的行为, 又不会刷屏. */
-        print_ms = (fabsf(g_foc.position_loop.pos_err_deg) >=
-                    g_foc.position_loop.arrive_tol_deg) ? 25U : 500U;
+        /* 日志节流(2026-10-11l 重做):
+           原来 "err 超差 ⇒ 25ms 一条"，一堵转就是每秒 40 条、每秒 ~9KB ——
+           ① RTT 上行缓冲写满后 NO_BLOCK_SKIP 直接**丢日志**(所以用户会看到
+              断头行, 甚至丢 [CMD]/[KEY] 回显); ② 调试信息根本看不清。
+           现在按"内容有没有变"定节拍:
+             位置/霍尔/目标 有变化 → 100ms;  完全不动(堵转/保持) → 500ms;
+             按 'v' 切 verbose → 25ms(查细节时手动开)。 */
+        {
+            float   mech = AngleObserver_GetMechDeg(&g_foc.angle,
+                                                    g_foc.config.pole_pairs);
+            uint8_t hh   = g_foc.hall.state;
+            float   tg   = g_foc.pos_target_deg_cmd;
+            uint8_t moving = (fabsf(mech - last_mech) > 0.02f) ||
+                             (hh != last_hall) ||
+                             (fabsf(tg - last_tgt) > 0.001f);
+            print_ms = log_verbose ? 25U : (moving ? 100U : 500U);
+            last_mech = mech;
+            last_hall = hh;
+            last_tgt  = tg;
+        }
         if ((now - last_print) >= print_ms) {
             last_print = now;
-            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f\r\n",
+            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f\r\n",
                  (unsigned long)now,
                  g_foc.state, g_foc.flags.fault, g_foc.fault_code,
                  (int)g_foc.hall.state,
@@ -808,7 +845,13 @@ int main(void)
                  g_foc.speed_loop.ref_erpm,
                  g_foc.speed_loop.erpm_now,   /* 速度环实际用的反馈(已低通) */
                  FOC_Control_GetPosIntegA(),  /* 位置环积分(A): 大 = 正在顶静摩擦 */
-                 FOC_Control_GetPosErpm());   /* 位置环阻尼用速度(eRPM): 振荡幅度 */
+                 FOC_Control_GetPosErpm(),    /* 位置环阻尼用速度(eRPM): 振荡幅度 */
+                 /* ---- 2026-10-11o 诊断四件套: 定位"停住了但 vsp 很大"是哪一路 ---- */
+                 AngleObserver_GetOmegaFiltErpm(&g_foc.angle, g_foc.config.pwm_freq),
+                 FOC_Control_GetVelPosErpm(),
+                 g_foc.angle.adv * 57.29577951f,
+                 (float)(g_foc.tick - g_foc.hall.edge_tick) /
+                     (g_foc.config.pwm_freq / 1000.0f));
         }
 
         /* ??RTT????????: ???? + ???? */

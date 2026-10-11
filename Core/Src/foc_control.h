@@ -105,6 +105,8 @@ void FOC_Control_SetPosTarget(FOC_Control_t *foc, float target_deg);
 float FOC_Control_GetPosIntegA(void);
 /* 位置环阻尼用的滤波速度(eRPM): 只用于日志/调试 */
 float FOC_Control_GetPosErpm(void);
+/* 2026-10-11o 诊断: 位置差分那一路的原始测速(eRPM) */
+float FOC_Control_GetVelPosErpm(void);
 void FOC_Control_SetSpeedRef(FOC_Control_t *foc, float ref_erpm);
 void FOC_Control_SetIqRef(FOC_Control_t *foc, float iq_ref);
 void FOC_Control_SetTorqueProbe(FOC_Control_t *foc, float iq_A, uint32_t dur_ms);
