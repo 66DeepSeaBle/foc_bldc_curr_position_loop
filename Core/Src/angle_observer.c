@@ -181,11 +181,14 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
     uint8_t h = hall->state;
     uint32_t dt;
     int8_t dir;
+    int8_t prev_dir;
 
     if (h == 0 || h == 7) {
         obs->synced = 0;
         return;
     }
+
+    prev_dir = obs->last_dir;        /* 进入本次边沿前的"上次确认方向" */
 
     /* ---- ???? ---- */
     if (hall->prev_state >= 1 && hall->prev_state <= 6) {
@@ -230,6 +233,65 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
             d = (obs->last_dir >= 0) ? 3 : -3;
         }
         obs->sect_run += d;
+    }
+
+    /* ★★ 2026-10-11af 方向反转 ⇒ "出去又回来", 净位移≈0 ----------------------
+       现象(10-11ae 日志): 转子停在齿槽=霍尔边界上, 一点机械抖动就让霍尔状态
+       来回翻。每条边沿都按 `扇区宽/dt` 算出 **±600~700eRPM 的假速度**
+       (实测 ob=-690), 而位置环经 10-11ad 的"最近有边沿就相信 v"直接采信 ⇒
+         ① 环路以为转子在高速倒转 ⇒ 拿 2.5A 去"补偿" ⇒ 真的把转子甩出去
+            (实测 t45 d0.8 被毁: vsp 冲到 -1000eRPM = 规划的 10 倍);
+         ② 模型进角 adv 被反复重载(τ=5ms 的衰减来不及生效) ⇒ 一路爬到扇区
+            钳位(adv=+33.32) ⇒ 电角度差 60° ⇒ 力矩只剩一半 ⇒ 日志前段那段
+            "2.3A 顶 4.6 秒转子一动不动"就是这么来的。
+       判据: **相邻两条边沿方向相反** = 转子出去又回来 ⇒ 平均速度≈0。
+       处理: 测速/加速度/进角外推全清零, adv 重置到入口, 并清掉窗口历史
+       (否则窗口估计会把"半去半回"平均成一个非零值); **扇区序号也还回去**
+       (否则读数会凭空整跳一个扇区—— 10-11af 实测日志里 `h=2 Pos=45.94`
+       与 `h=2 Pos=32.13` 交替出现就是这个, 而 h 根本没变)。
+       注意这是**真边沿**(不是 glitch): edge_tick 照常更新,
+       dte/停转判据/边沿计数都不受影响。 */
+    if (prev_dir != 0 && dir != prev_dir) {
+        /* ⚠⚠ 2026-10-11ai **绝不能在这里动 sect_run**(10-11ag 的 `sect_run -= dsect`
+           是本轮 1/2/4/8 全部抖动的真正根因, 已删)。
+           理由: 位置公式是
+               pos = 2π·((sect_run - Ring(state)) / 6) + entry + local
+           那个 `/6` 是**整型除法**, 整段算法依赖一条隐含不变量
+               sect_run ≡ Ring(hall.state)  (mod 6)
+           —— 只有同余成立时除出来的才是精确的圈数。
+           而“边沿累加”那一步(obs->sect_run += d, d = Ring(new)-Ring(old)) **恰好**
+           在维持这条不变量。10-11ag 在方向反转时把 d 还回去 ⇒ 不变量被打破
+           ⇒ 整数除法向零截断 ⇒ 位置凭空多/少 **1/6 圈 = 15.4°机械**(连
+           两次反转就 30.8°)。实测(10-11ah 日志)完全对得上:
+             · 同一个转子读数在 -60.79(h=1,adv=-30.53) 与 -34.16(h=3,adv=+15.31)
+               之间以 20~40Hz 来回跳(差 26.6° ≈ 15.4 + 3.7 外推);
+             · `jp`(“物理上不可能的位置跳变”计数) 2.4 秒里 0→137;
+             · err=+34.16 却给 Iqref=-1.30, 而 err=+60.79 给 +2.50 —— 同一个
+               误差符号给出**相反**的电流符号, 说明读数本身已经不是一个
+               连续的位置通道; 环路于是 20~40Hz 地正反推 = 用户听到的抖动。
+           现在: 反转只清测速历史/外推速度(那是它本来要解决的问题), 位置
+           继续由 (扇区, 进角) 按不变量算出 ⇒ 反转时 adv = -dir·hw 正好落在
+           两个相邻扇区**共享的那条边界**上 ⇒ 读数连续 ✓。 */
+        for (int i = 0; i < 4; i++) {
+            obs->edge_hist_tick[i] = 0U;
+            obs->edge_hist_acc[i]  = 0.0f;
+        }
+        obs->edge_hist_idx   = 0U;
+        obs->omega           = 0.0f;
+        obs->omega_filt      = 0.0f;
+        obs->omega_prev      = 0.0f;
+        obs->alpha           = 0.0f;
+        obs->alpha_filt      = 0.0f;
+        obs->pos_ext_w       = 0.0f;
+        obs->pos_ext_tick    = now_tick;   /* 别让 GetTheta 再用旧速度重载 */
+        hall->prev_state     = h;
+        hall->edge_tick      = now_tick;
+        hall->prev_dt        = 0U;         /* 抖动 ⇒ dt 无意义 */
+        hall->dir            = dir;
+        obs->theta_base      = GetSectorCenter(h, obs->hall_dir_rev);
+        obs->theta_halfwidth = SECTOR_HALFWIDTH[h];
+        obs->adv             = -(float)dir * obs->theta_halfwidth;
+        return;
     }
 
     dt = now_tick - hall->edge_tick;
@@ -511,8 +573,14 @@ float AngleObserver_GetTheta(Angle_Observer_t *obs, const Hall_State_t *hall,
             float   local = obs->adv + SECTOR_HALFWIDTH[hs];        /* 0 .. 2hw */
             float   entry = SectorEntryRad(hs, obs->hall_dir_rev);
             /* 圈数用 (sect_run - r)/6 算: sect_run ≡ r (mod 6) 由构造保证,
-               所以这个差恰好是 6 的整数倍(不会出现除不尽的情况) */
-            float pos_abs = 6.28318531f * (float)((obs->sect_run - r) / 6)
+               所以这个差恰好是 6 的整数倍(不会出现除不尽的情况)。
+               ★ 2026-10-11ai: 这里改用**四舍五入**而不是 C 的向零截断 ——
+               万一哪条路径意外打破了同余(例如算法以后再改), 四舍五入给出
+               的是“最近的那一圈”, 误差最多半个电周期(45°电=11°机械并随后被
+               下一次边沿纠正); 而向零截断会把 -1/6 圈直接算成 0 圈 ⇒
+               凭空 +15.4°机械的位置偏置(这次的就是它)。 */
+            float turns = (float)(obs->sect_run - r) / 6.0f;
+            float pos_abs = 6.28318531f * lroundf(turns)
                             + entry + local;
             obs->pos_abs_rad  = pos_abs;
             obs->elec_acc_deg = (pos_abs - obs->pos_ref_rad) * 57.29577951f;

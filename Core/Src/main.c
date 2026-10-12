@@ -20,7 +20,7 @@ static uint8_t motor_pwm_off_logged = 0;
 
 /* 固件版本标签: 开机打一次, 并**每秒跟着 [ADCR] 打一次** —— 这样即使用户
    只截取日志中段, 也能一眼看出跑的是哪个版本(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-11ac extdecay-5ms"
+#define FW_BUILD_TAG  "2026-10-11am traj-model-ff"
 
 /* ---- ????????? (RTT) ---- */
 #define ANGLE_LOG_MS   10U          /* 角度采样打印周期 (ms) */
@@ -437,6 +437,70 @@ static void AutoStartIfIdle(void)
     }
 }
 
+/* ---- 2026-10-11ae 命令解析: `t<角度> d<秒>` + 回车 ---------------------
+   为什么"回车才解析": t(目标) 与 d(用时) 必须是**同一时刻**的参数。若边收
+   边执行, t 先到就会按"普通移动"起步, 等 d 到了再改时长 = 边走边改,
+   轨迹就不再是一条 9 段曲线了。 */
+static char    g_cmd_buf[24];
+static uint8_t g_cmd_len     = 0U;
+static uint8_t g_cmd_pending = 0U;   /* 1 = 正在收命令(首字符 t/T) */
+
+/* 从 p 开始解析一个十进制浮点(可带 ±), 返回停在数字之后的指针 */
+static const char *Cmd_Num(const char *p, float *out)
+{
+    float sgn = 1.0f, val = 0.0f, frac = 0.0f, div = 1.0f;
+    if (*p == '+') {
+        p++;
+    } else if (*p == '-') {
+        sgn = -1.0f;
+        p++;
+    }
+    while (*p >= '0' && *p <= '9') {
+        val = val * 10.0f + (float)(*p - '0');
+        p++;
+    }
+    if (*p == '.') {
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            div *= 10.0f;
+            frac += (float)(*p - '0') / div;
+            p++;
+        }
+    }
+    *out = sgn * (val + frac);
+    return p;
+}
+
+/* 1 = 是定时命令(已填 out_tgt/out_dur); 0 = 不是(例如只按了 't') */
+static uint8_t Cmd_ParseTimed(float *out_tgt, float *out_dur)
+{
+    const char *p = g_cmd_buf;
+    uint8_t have_t = 0U;
+    *out_tgt = 0.0f;
+    *out_dur = 0.0f;
+    while (*p != '\0') {
+        char c = *p;
+        if (c == 't' || c == 'T' || c == 'd' || c == 'D') {
+            const char *q  = p + 1;
+            const char *q0 = q;
+            float v = 0.0f;
+            if (*q == '+' || *q == '-') q++;
+            if ((*q >= '0' && *q <= '9') || *q == '.') {
+                q = Cmd_Num(q0, &v);
+                if (c == 't' || c == 'T') {
+                    *out_tgt = v;
+                    have_t   = 1U;
+                } else {
+                    *out_dur = v;
+                }
+                p = q - 1;          /* 循环末尾会 p++ */
+            }
+        }
+        p++;
+    }
+    return have_t;
+}
+
 int main(void)
 {
     FOC_Config_t config;
@@ -584,8 +648,11 @@ int main(void)
     LOGD("[MAIN] FOC ready (IDLE). dir_rev=%d torque_dir=%d. 's'=open-loop test  'c'=manual hall verify\r\n",
          (int)g_foc.config.hall_dir_rev, (int)g_foc.torque_dir);
     LOGD("[MAIN] Keys: o=MANUAL  u/i=V+/-0.01  n/m=V+/-0.05  h/l=freq +/-1Hz  f=dir  t=stop\r\n");
-    LOGD("[MAIN] Keys: s=auto V/f test  p=PWM smoke test  r=re-align  d=dir_rev  y=torque\r\n");
+    LOGD("[MAIN] Keys: s=auto V/f test  p=PWM smoke test  r=re-align  D=dir_rev(cap)  y=torque\r\n");
     LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  z=target 0  0~9=digit*45deg(auto-start)  c=hall verify\r\n");
+    LOGD("[MAIN] Keys: t<deg> d<sec> + Enter = TIMED move (accel/cruise/decel = T/9, 7T/9, T/9)\r\n");
+    LOGD("[MAIN] Keys: 0~9/z 默认也走定时轨迹: |Δ|<=360deg 统一 %.1fs 走完\r\n",
+         (double)FOC_POS_DEFAULT_TM_S);
     LOGD("[MAIN] Keys: v=verbose log(25ms/line, default 500ms idle / 100ms moving)\r\n");
     LOGD("[ANG] idx,state,hall,synced,elec_deg,mech_deg,erpm\r\n");
     (void)g_log_seq;    /* [ANG] 已降为 LOGI(默认不打印), 序号不再被引用 */
@@ -634,6 +701,56 @@ int main(void)
             LOGD("[KEY] '%c' (0x%02X) st=%d flt=%d\r\n",
                  (ch >= 32 && ch < 127) ? ch : '.', (unsigned)ch,
                  (int)g_foc.state, (int)g_foc.flags.fault);
+
+            /* ★★ 2026-10-11ae/ag 命令缓冲: `t<角度> d<秒>` + 回车。
+               ⚠ 必须是**任何状态下**、首字符 't'/'T' 就进入收命令状态 —— 10-11ae
+               版本限定了"只在位置环(st=5)"才收, 结果用户在 IDLE 下打 `t180 d2`
+               时字符全落到单键处理上, 其中 **'d' 把 dir_rev 翻了**(日志里的
+               `[CMD] dir_rev -> 0` + ALIGN 偏移从 156.1° 变成 203.9°),
+               后面整个日志都在反向换相下运行 ⇒ 全部失控。
+               进入收命令后到回车前, 字符**不再**交给单键处理(不会误触发)。 */
+            if (!g_cmd_pending && !hall_verify_mode &&
+                (ch == 't' || ch == 'T')) {
+                g_cmd_pending = 1U;
+                g_cmd_len     = 0U;
+                g_cmd_buf[0]  = '\0';
+            }
+            if (g_cmd_pending) {
+                if (ch == '\r' || ch == '\n') {
+                    float tgt = 0.0f, dur = 0.0f;
+                    if (Cmd_ParseTimed(&tgt, &dur)) {
+                        LOGD("[CMD] timed: t%.1f d%.2f\r\n", tgt, dur);
+                        FOC_Control_SetTimedTarget(&g_foc, tgt, dur);
+                        AutoStartIfIdle();   /* IDLE/FAULT 时也一样自动起步 */
+                    } else if (g_cmd_len == 1U &&
+                               (g_cmd_buf[0] == 't' || g_cmd_buf[0] == 'T')) {
+                        /* 只按 't' + 回车 = 原来的"停止开环测试"语义 */
+                        if (g_foc.ol_active) {
+                            FOC_Control_StopOpenLoopTest(&g_foc, "key T");
+                        } else {
+                            LOGD("[CMD] no open-loop test running\n");
+                        }
+                    } else if (g_cmd_len > 0U) {
+                        LOGD("[CMD] unknown command \"%s\" (use: t<deg> d<sec> + Enter)\r\n",
+                             g_cmd_buf);
+                    }
+                    g_cmd_pending = 0U;
+                    g_cmd_len     = 0U;
+                    g_cmd_buf[0]  = '\0';
+                    continue;
+                }
+                if ((ch == 8 || ch == 127) && g_cmd_len > 0U) {   /* 退格 */
+                    g_cmd_buf[--g_cmd_len] = '\0';
+                    continue;
+                }
+                if (ch >= 32 && ch < 127 &&
+                    g_cmd_len < (uint8_t)(sizeof(g_cmd_buf) - 1U)) {
+                    g_cmd_buf[g_cmd_len++] = (char)ch;
+                    g_cmd_buf[g_cmd_len]   = '\0';
+                }
+                continue;
+            }
+
             if (hall_verify_mode) {
                 if (ch == 'q' || ch == 'Q') HallVerify_Exit();
             } else {
@@ -647,8 +764,12 @@ int main(void)
                     log_verbose = log_verbose ? 0U : 1U;
                     LOGD("[CMD] verbose log %s (%ums/line)\r\n",
                          log_verbose ? "ON" : "OFF",
-                         log_verbose ? 25U : 500U);                } else if (ch == 'd' || ch == 'D') {
-                    /* 运行时翻转霍尔方向(dir_rev), 用于判断闭环换相是否反向 */
+                         log_verbose ? 25U : 500U);                } else if (ch == 'D') {
+                    /* 运行时翻转霍尔方向(dir_rev), 用于判断闭环换相是否反向。
+                       ★ 2026-10-11ag: 只认**大写 'D'** —— 小写 'd' 与定时命令
+                       `t180 d2` 里的 d 同字, 10-11ae 实测它被误触发一次就把
+                       整个 dir_rev 翻反了(ALIGN 偏移从 156.1° 变 203.9°),
+                       之后所有闭环都反向换相。 */
                     g_foc.angle.hall_dir_rev = g_foc.angle.hall_dir_rev ? 0 : 1;
                     g_foc.config.hall_dir_rev = g_foc.angle.hall_dir_rev;
                     LOGD("[CMD] dir_rev -> %d (torque=%d)\n",
@@ -704,7 +825,8 @@ int main(void)
                     FOC_Control_SetState(&g_foc, FOC_STATE_ALIGN);
                     LOGD("[CMD] fault cleared -> ALIGN (target reset to hold)\n");
                 } else if (ch == 'z' || ch == 'Z') {
-                    FOC_Control_SetPosTarget(&g_foc, 0.0f);
+                    /* ★ 2026-10-11ak: 回零也走定时轨迹(默认 FOC_POS_DEFAULT_TM_S) */
+                    FOC_Control_SetTimedTarget(&g_foc, 0.0f, FOC_POS_DEFAULT_TM_S);
                     LOGD("[CMD] Zero position\n");
                     AutoStartIfIdle();
                 } else if (ch == 'j' || ch == 'J') {
@@ -719,7 +841,16 @@ int main(void)
                     float now_deg = AngleObserver_GetMechDeg(&g_foc.angle,
                                                              g_foc.config.pole_pairs);
                     float de = target - now_deg;
-                    FOC_Control_SetPosTarget(&g_foc, target);
+                    /* ★★ 2026-10-11ak 默认改走**定时轨迹**(≤360° 统一 1s):
+                       旧律靠“速度环 + 长距爬行”, 实测在齿槽上是一跳一跳的
+                       (走一格停 150~300ms), 且到位前会冲过一格再被推回来。
+                       轨迹是“位置参考+速度前馈”, 末速归零, 到位才安静。 */
+                    if (fabsf(de) <= 360.5f) {
+                        FOC_Control_SetTimedTarget(&g_foc, target,
+                                                   FOC_POS_DEFAULT_TM_S);
+                    } else {
+                        FOC_Control_SetPosTarget(&g_foc, target);
+                    }
                     /* 把按键那一瞬的位置/误差一起打出来: 反复出现"按了没动"的疑问,
                        其实多数是"已经在目标容差内" —— 位置环在 |err|<容差 时本来就
                        故意撤力矩(靠静摩擦保持), 所以按同一个数字键不会有任何动作。 */
@@ -825,7 +956,7 @@ int main(void)
         }
         if ((now - last_print) >= print_ms) {
             last_print = now;
-            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f | mv=%d jp=%u vs=%.0f | hl=%d gv=%d bh=%d cr=%u\r\n",
+            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f | mv=%d jp=%u vs=%.0f | hl=%d gv=%d bh=%d cr=%u tm=%u sl=%u\r\n",
                  (unsigned long)now,
                  g_foc.state, g_foc.flags.fault, g_foc.fault_code,
                  (int)g_foc.hall.state,
@@ -860,7 +991,10 @@ int main(void)
                  (int)FOC_Control_GetPosHoldFlag(),
                  (int)FOC_Control_GetPosGiveFlag(),
                  (int)FOC_Control_GetPosBlockFlag(),
-                 (unsigned)FOC_Control_GetPosHopCnt());
+                 (unsigned)FOC_Control_GetPosHopCnt(),
+                 (unsigned)FOC_Control_GetTimedPhase(),   /* 2026-10-11ae: 0=无轨迹, 1..9=段号 */
+                 /* ★ 2026-10-11ah: sl = 近目标"松手静默"中(跨边界后强行撤力 250ms) */
+                 (unsigned)FOC_Control_GetPosSettleFlag());
         }
 
         /* ??RTT????????: ???? + ???? */

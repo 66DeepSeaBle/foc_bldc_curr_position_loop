@@ -118,7 +118,18 @@ float FOC_Control_GetVelWinErpm(void);
 uint8_t  FOC_Control_GetPosHoldFlag(void);
 uint8_t  FOC_Control_GetPosGiveFlag(void);
 uint8_t  FOC_Control_GetPosBlockFlag(void);
+uint8_t  FOC_Control_GetPosSettleFlag(void);   /* 1 = 近目标"松手静默"中 */
+
+/* ★ 2026-10-11ak “默认目标”的定时轨迹时长: 数字键/`z` 等按目标一键到位时,
+   ≤360° 的移动统一按这个时长走梯形轨迹(加速/匀速/减速), 而不是
+   靠“速度环 + 长距爬行”的旧律 —— 旧律在齿槽上是一跳一跳的。 */
+#define FOC_POS_DEFAULT_TM_S   1.0f
 uint16_t FOC_Control_GetPosHopCnt(void);
+
+/* ★★ 2026-10-11ae 定时轨迹(命令 `t<角度> d<秒>`): 目标 + 到达用时(秒) */
+void    FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg,
+                                   float dur_s);
+uint8_t FOC_Control_GetTimedPhase(void);   /* 0=未激活, 1..9=加速/匀速/减速 段号 */
 void FOC_Control_SetSpeedRef(FOC_Control_t *foc, float ref_erpm);
 void FOC_Control_SetIqRef(FOC_Control_t *foc, float iq_ref);
 void FOC_Control_SetTorqueProbe(FOC_Control_t *foc, float iq_A, uint32_t dur_ms);
