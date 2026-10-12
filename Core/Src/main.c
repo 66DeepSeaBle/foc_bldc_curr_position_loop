@@ -20,7 +20,7 @@ static uint8_t motor_pwm_off_logged = 0;
 
 /* 固件版本标签: 开机打一次, 并**每秒跟着 [ADCR] 打一次** —— 这样即使用户
    只截取日志中段, 也能一眼看出跑的是哪个版本(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-11am traj-model-ff"
+#define FW_BUILD_TAG  "2026-10-11ap traj-sole-authority"
 
 /* ---- ????????? (RTT) ---- */
 #define ANGLE_LOG_MS   10U          /* 角度采样打印周期 (ms) */
@@ -955,8 +955,10 @@ int main(void)
             last_tgt  = tg;
         }
         if ((now - last_print) >= print_ms) {
+            float td_verr, td_ff, td_trim, td_vobs;   /* 2026-10-11ao 轨迹诊断 */
             last_print = now;
-            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f | mv=%d jp=%u vs=%.0f | hl=%d gv=%d bh=%d cr=%u tm=%u sl=%u\r\n",
+            FOC_Control_GetTrajDiag(&td_verr, &td_ff, &td_trim, &td_vobs);
+            LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f | mv=%d jp=%u vs=%.0f | hl=%d gv=%d bh=%d cr=%u tm=%u sl=%u | tv=%.1f ff=%.2f tr=%.2f vob=%.0f\r\n",
                  (unsigned long)now,
                  g_foc.state, g_foc.flags.fault, g_foc.fault_code,
                  (int)g_foc.hall.state,
@@ -994,7 +996,10 @@ int main(void)
                  (unsigned)FOC_Control_GetPosHopCnt(),
                  (unsigned)FOC_Control_GetTimedPhase(),   /* 2026-10-11ae: 0=无轨迹, 1..9=段号 */
                  /* ★ 2026-10-11ah: sl = 近目标"松手静默"中(跨边界后强行撤力 250ms) */
-                 (unsigned)FOC_Control_GetPosSettleFlag());
+                 (unsigned)FOC_Control_GetPosSettleFlag(),
+                 /* ★ 2026-10-11ao 轨迹诊断: tv=轨迹位置误差(°), ff=摩擦前馈(A),
+                    tr=微调+阻尼(A), vob=观测速度(°/s) */
+                 td_verr, td_ff, td_trim, td_vobs);
         }
 
         /* ??RTT????????: ???? + ???? */

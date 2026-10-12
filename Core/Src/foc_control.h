@@ -130,6 +130,9 @@ uint16_t FOC_Control_GetPosHopCnt(void);
 void    FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg,
                                    float dur_s);
 uint8_t FOC_Control_GetTimedPhase(void);   /* 0=未激活, 1..9=加速/匀速/减速 段号 */
+/* ★ 2026-10-11ao 轨迹诊断(仅日志): 轨迹位置误差/摩擦前馈/微调/观测速度 */
+void    FOC_Control_GetTrajDiag(float *verr, float *iq_ff, float *iq_trim,
+                                float *vobs);
 void FOC_Control_SetSpeedRef(FOC_Control_t *foc, float ref_erpm);
 void FOC_Control_SetIqRef(FOC_Control_t *foc, float iq_ref);
 void FOC_Control_SetTorqueProbe(FOC_Control_t *foc, float iq_A, uint32_t dur_ms);

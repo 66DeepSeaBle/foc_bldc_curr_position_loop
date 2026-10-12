@@ -857,8 +857,30 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    注意 500°/s 仍然**远低于本机能力**(空载 1A≈10000°/s²), 而齿槽只能擒住
    ≤195°/s —— 齿槽这一条不是靠巡航限制保证的, 而是靠**轨迹末速归零**
    (梯形曲线的收尾速度是 0), 所以提高巡航不影响到位安静度。 */
-#define POS_TM_VMAX_MECH_DEG_S  500.0f   /* 巡航速度上限(机械°/s) */
+#define POS_TM_VMAX_MECH_DEG_S  800.0f   /* 巡航速度上限(机械°/s) */
 #define POS_TM_ACC_MAX_DEG_S2   8000.0f  /* 峰值加速度上限(机械°/s²) */
+/* ★★ 2026-10-11an 4 段时间分配 + 慢速逼近段(用户要求: “起步慢慢加速、
+   到目标附近减速慢慢接近”)
+   ------------------------------------------------------------------
+   原来只有 3 段(1/9 加速 + 7/9 匀速 + 1/9 减速), 且减速末端速度=0:
+   D=360°/1s 时峰值加速度要到 5724°/s²、减速率 3645°/s², 而且是**到点才
+   停** ⇒ 实测(10-11am 日志)轨迹跑完时读数还差 16~22°(齿槽附近读数本身
+   就有一个扇区的粒度) ⇒ 手头的力立刻掉到 0, 由“松手静默 + 爬行脉冲”接手
+   ⇒ 用户看到的“突然刹车、然后正反转微调”。
+   现在改成 4 段, 且**减速只降到 vapp=40°/s**, 再匀速逼近最后一段:
+        加速 2/9  →  匀速 3/9  →  减速 2/9(→vapp)  →  逼近 2/9(vapp)
+   好处:
+     ① 峰值加速度降到 ~1/3(同样的 T、D), 起步平缓;
+     ② 最后 2/9 的时间都在 ~40°/s 慢走 ⇒ **到目标前就已经“慢慢接近”**,
+        而不是到点才停; 40°/s 远低于齿槽捣住极限 195°/s ⇒ 到位很柔;
+     ③ 若期间读数已经跨到目标扇区(err≈0), 心跳会提前结束轨迹交给死区,
+        两边都不会抢。
+   距离关系: D = vc·(ta/2 + tc + td/2) + vapp·(td/2 + tapp)
+     ⇒ 反解 vc(见 SetTimedTarget)。 */
+#define POS_TM_TA_FRAC          (2.0f / 9.0f)   /* 加速占比(时间) */
+#define POS_TM_TC_FRAC          (3.0f / 9.0f)   /* 匀速占比 */
+#define POS_TM_TD_FRAC          (2.0f / 9.0f)   /* 减速占比 */
+#define POS_TM_VAPP_DEG_S       40.0f           /* 逼近段速度(机械°/s) */
 /* ★★ 2026-10-11am 轨迹改为“**物理模型前馈 + 小权限位置微调**”，完全不用测速
    ----------------------------------------------------------------------
    实测(10-11al 日志): 把轨迹的速度环增益提到 0.03 之后, **过程大幅抖动** ——
@@ -878,15 +900,87 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    机理: 这是“前馈伺服”—— 摩擦项抵消摩擦、加速度项出业绩加速度, 剩下的
    位置误差只需要一个**常量偏置**(verr ≈ ±(1.25−fric)/0.05 ≈ ±7°)就能平衡,
    而常量偏置意味着**速度与规划完全一致**(零速度误差), 恰好是我们要的。 */
-#define POS_TM_FF_A             1.25f     /* 摩擦前馈(A, 按轨迹速度方向) */
-#define POS_TM_FF_VMIN          5.0f      /* |轨迹速度| 小于它 ⇒ 前馈取消(机械°/s) */
+/* ★★ 2026-10-11ao: 摩擦前馈改成"速度相关(Stribeck)" —— 这是"起步/减速
+   不平滑、有振动"的直接根因。
+   实测(10-11an 日志解码):
+     · `t180 d2`(D=180/T=2s, 规划巡航 138°/s): 起步后 100ms **读数已经
+       超前规划 21°**, 300ms 时超前 50°, 峰值实测 860°/s(规划的 6 倍)
+       ⇒ 转子一路跑在规划前面; 而位置微调只被允许 ∓0.8A, 最小命令
+       = 1.25−0.8 = **+0.45A(仍在往前推)** ⇒ **环路永远饱和** ⇒ 电流在
+       0.45~2.05A 之间打摆 = 电流方波 = 用户听到的振动。
+     · `8`(D=270/T=1s) 中段 verr 在 −21°…+51° 之间摆(全程饱和), 读数增量
+       在 110°/s 与 444°/s 之间跳。
+     · `z`(D=134/T=1s) 反而干净 —— 因为它需要的力矩小(命令 ~0.70A)。
+   ⇒ 两个结论:
+     ① **1.25A 是"静摩擦(破黏)"而不是"滑动摩擦"**。滑动时只需 ~0.70A
+        (实测 z 段: 命令 0.70A 就能稳住 ~230°/s)。拿静摩擦的值去维持
+        匀速 ⇒ 多出 ~0.5A = 5000°/s² ⇒ 必然一路加速、环路饱和;
+     ② 减速段更糟: 前馈仍是 ±1.25A, 位置微调最多拉到 ∓0.8A ⇒ 命令最低
+        **+0.45A(还在往前推)** ⇒ "到目标附近减速"根本做不到, 只能等时间
+        到点后硬切 ⇒ 就是用户说的"突然刹车"。
+   对策: 摩擦前馈按速度成型(Stribeck) —— 静止时给到破黏电流(保证能起步),
+   速度一上来就降到滑动摩擦值(保证匀速时不再自加速):
+        命令 = 摩擦(v_轨迹) + a_轨迹/10000 + 位置微调 + 速度阻尼
+   · 起步: v=0 ⇒ 1.45A(刚好顶住静摩擦), 而 a_轨迹 从 0 平滑长起来
+     (S 曲线 a(0)=0) ⇒ **净力矩从 0 平滑增加 ⇒ 起步是真的"慢慢加速"**;
+   · 匀速: v 高 ⇒ 摩擦项降到 0.70~0.9A ⇒ 不再自加速, 环路不饱和;
+   · 减速: v 降到 vapp(40°/s) ⇒ 摩擦项 ~1.0A, a_轨迹为负 ⇒ 命令自然降到
+     0.6~0.7A ⇒ **真的在减速**, 不再需要"硬切"; 到目标前 v→0 时前馈
+     按比例缩到 0 ⇒ 末速自然归零。 */
+#define POS_TM_FRIC_STATIC_A    1.45f    /* 等效静摩擦(破黏)电流(A) */
+#define POS_TM_FRIC_SLIDE_A     0.70f    /* 等效滑动摩擦电流(A) */
+#define POS_TM_FRIC_V0_DEG_S    25.0f    /* Stribeck 过渡速度尺度(机械°/s) */
+#define POS_TM_FF_VMIN          1.0f     /* |轨迹速度| 低于它 ⇒ 前馈按比例缩到 0 */
+#define POS_TM_FF_SIGN_DEG_S    3.0f     /* 前馈符号的软过渡尺度(机械°/s) */
 #define POS_TM_A_PER_DEG_S2     0.0001f   /* 1A ≈ 10000°/s² ⇒ 0.0001 A/(°/s²) */
-#define POS_TM_P_TRIM_A_PER_DEG 0.050f    /* 位置微调增益(A/机械°) */
-#define POS_TM_P_TRIM_MAX_A     0.80f     /* 位置微调限幅(A) < 破黏 1.15A */
-/* 轨迹状态量(2026-10-11am): 本拍电流 / 上一拍轨迹速度(用于算加速度项) */
+/* ★★ 2026-10-11ao: 位置微调增益 0.05→0.03, **限幅 0.8→2.0A**。
+   限幅原来卡在 0.8A(< 破黏 1.15A)是为了"读数毛刺推不动转子", 但它同时
+   也把**刹车权限**一起卡死了(见上注 ② )。注意风险其实由**增益**决定而不是
+   限幅: 一个扇区(15.47°)的读数毛刺仍然只产生 0.03×15.47 = 0.46A 的变化;
+   要打到 2.0A 需要 66° 的真实误差 —— 那本来就是该刹车的时候。 */
+#define POS_TM_P_TRIM_A_PER_DEG 0.030f    /* 位置微调增益(A/机械°) */
+#define POS_TM_P_TRIM_MAX_A     2.00f     /* 位置微调限幅(A) —— 必须大于摩擦前馈才能刹车 */
+/* ★★ 2026-10-11ao 阻尼(位置环原来"零阻尼"):
+   位置误差环是 `a = 10000·Kp·verr` ⇒ ω_n = √(10000×0.03) = 17rad/s
+   = **2.8Hz 的无阻尼振荡器** —— 任何扰动(齿槽、摩擦突变、读数台阶)都会
+   激起永不衰减的振荡, 这就是"一直在抖"的另一半原因。位置环必须加阻尼,
+   但实测本机 50~400°/s 区间的**测速全是毛刺**(±1000eRPM), 直接拿它做
+   阻尼只会变成继电器。所以用一个**模型速度观测器**:
+     被控对象基本就是"1A → 10000°/s²"的积分器, 所以"净指令电流积分"
+     本身就是平滑、无毛刺的速度估计(带宽由我们定), 再用**慢速位置校正**
+     消掉摩擦估计误差的长期漂移。
+   阻尼增益取 0.002 A/(°/s) ⇒ 环路增益 20rad/s(3.2Hz), 配 30rad/s 的观测器
+   带宽 ⇒ 相位滞后约 33°, 阻尼有效而不会自激。 */
+#define POS_TM_DAMP_A_PER_DEG_S 0.0020f   /* 阻尼增益(A/(°/s)) */
+#define POS_TM_K_DEG_S2_PER_A   10000.0f  /* 实测 1A ≈ 10000°/s² */
+#define POS_TM_OBS_WO_RAD_S     30.0f     /* 速度观测器带宽(rad/s) ⇒ 滞后 ~33ms */
+#define POS_TM_OBS_VMAX_DEG_S   2000.0f   /* 观测速度限幅 */
+/* ★★ 2026-10-11ap 两个限幅 —— 修实测(`8`=360°/1s, 10-11ao 日志)"运行中间一段
+   比较大的振动":
+   ① **轨迹期间一律跳过"实测速度驱动"的旁路**(超速保险/脱困刹车/破黏脉冲/
+      分档限流, 见 FOC_DoPositionLoop 里 2026-10-11ap 的整块跳过):
+      实测中段 `Iqref` 在 **±2.50A 之间打摆**、读数在 299↔314↔320 之间来回
+      —— 就是"超速保险"(`s_pos_flying && |vsp|>250eRPM ⇒ 满刹车`) 在按
+      **假速度**砸电流(当时转子其实还在规划后面 tv=+36°)。轨迹律自己有
+      完整限幅, 不需要它们。
+   ② **驱动侧限流 1.9A**: 起步时转子被静摩擦搵住不动, 而参考点一直在前进
+      ⇒ 位置微调+阻尼不断累积 ⇒ 电流顶到 2.5A 才搵开静摩擦 ⇒ 净力矩
+      (2.5−1.45)=1.05A = 10500°/s² ⇒ 实测起步 30ms 就飞到 **~2000°/s**。
+      限到 1.9A(比实测最深的破黏 1.6A 还高 0.3A) ⇒ 搵开瞬间净力矩
+      ≤0.45A ⇒ 起步平缓得多。刹车侧不受此限(仍到 2.5A)。 */
+#define POS_TM_IQ_DRIVE_MAX_A   1.90f     /* 轨迹期间驱动方向电流上限(A) */
+#define POS_TM_DAMP_MAX_A       0.50f     /* 阻尼项自己的限幅(A, 观测速度只~±100°/s 可信) */
+/* 轨迹状态量(2026-10-11am 模型前馈 / 2026-10-11ao 速度观测器):
+   s_tm_iq=本拍电流; s_tm_vprev=上一拍轨迹速度(算加速度项);
+   s_tm_vobs/s_tm_posobs=速度观测器状态(只用于阻尼) */
 static float   s_tm_iq          = 0.0f;
 static float   s_tm_vprev       = 0.0f;
 static uint8_t s_tm_vprev_valid = 0U;
+static float   s_tm_vobs        = 0.0f;
+static float   s_tm_posobs      = 0.0f;
+static float   s_tm_dbg_verr    = 0.0f;   /* 日志: 轨迹位置误差(°) */
+static float   s_tm_dbg_ff      = 0.0f;   /* 日志: 摩擦前馈(A) */
+static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
 /* ★★ 2026-10-11al 60→150: 收尾段靠轨迹修正项把最后几度拉进来(见 POS_TM_DONE_DEG),
    60°/s 对 20° 的滞后要 0.35s 而且已经偏慢; 150°/s 仍低于齿槽擒住极限 195°/s。 */
 #define POS_TM_TRIM_MAX_DEG_S   150.0f   /* 跟踪修正项限幅(机械°/s) */
@@ -1103,6 +1197,7 @@ static uint32_t s_tm_Ttick  = 0U;
 static float    s_tm_deg0   = 0.0f;   /* 轨迹起点的机械角读数(°) */
 static int8_t   s_tm_sgn    = 1;
 static float    s_tm_vc     = 0.0f;   /* 巡航速度(机械°/s) */
+static float    s_tm_vapp   = 0.0f;   /* 逼近段速度(机械°/s, 2026-10-11an) */
 /* 2026-10-11v: 上一次指令电流(用于检测大阶跃 ⇒ 预置电流环积分) */
 static float    s_pos_iq_prev    = 0.0f;
 /* 脱困刹车状态(2026-10-11j) */
@@ -1163,34 +1258,42 @@ static uint32_t s_pos_err_run_tick = 0U;
 static uint32_t s_pos_fast_cnt = 0U;
 static uint32_t s_pos_block_tick = 0U;   /* blocked_hard 置位的时刻 */
 
-/* ---- 2026-10-11ae 定时轨迹曲线(见 POS_TM_PART 注释) ----------------
-   输入: t = 已过去的时间(s); ta/tc/td = 加速/匀速/减速时长(s); vc = 巡航(°/s)
-   输出: 返回值 = 已走过的机械角度(magnitude, 0..vc·8T/9); *v_out = 当前速度
-         (magnitude, °/s)。三段都是解析式, 不靠积分累积, 所以不会漂。 */
-static float TM_Profile(float t, float ta, float tc, float td, float vc,
-                        float *v_out)
+/* ---- 2026-10-11an 定时轨迹曲线: **4 段**(见 POS_TM_TA_FRAC 注释) ------
+   输入: t=已过去的时间(s); ta/tc/td/tapp=加速/匀速/减速/逼近时长(s);
+         vc=巡航(°/s); vapp=逼近速度(°/s)
+   输出: 返回值=已走过的机械角度(magnitude); *v_out=当前速度(°/s)
+   四段全解析式 ⇒ 不积分、不漂。斜坡内部是升余弦(S 形) ⇒ 加速度连续。 */
+static float TM_Profile4(float t, float ta, float tc, float td, float tapp,
+                         float vc, float vapp, float *v_out)
 {
     const float PI = 3.14159265f;
+    float p1 = vc * ta * 0.5f;
+    float p2 = p1 + vc * tc;
+    float p3 = p2 + (vc + vapp) * td * 0.5f;
     float p;
     if (t <= 0.0f) {
         *v_out = 0.0f;
         return 0.0f;
     }
-    if (t < ta) {                                    /* 第 1 份: 加速(S 形) */
+    if (t < ta) {                                    /* 加速(S 形): 0 → vc */
         float u = t / ta;
         *v_out = vc * 0.5f * (1.0f - cosf(PI * u));
         p = vc * ta * (u * 0.5f - sinf(PI * u) / (2.0f * PI));
-    } else if (t < ta + tc) {                        /* 第 2..8 份: 匀速 */
+    } else if (t < ta + tc) {                        /* 匀速: vc */
         *v_out = vc;
-        p = vc * ta * 0.5f + vc * (t - ta);
-    } else if (t < ta + tc + td) {                   /* 第 9 份: 减速(S 形) */
-        float u = (t - ta - tc) / td;
-        *v_out = vc * 0.5f * (1.0f + cosf(PI * u));
-        p = vc * ta * 0.5f + vc * tc
-            + vc * td * (u * 0.5f + sinf(PI * u) / (2.0f * PI));
-    } else {                                         /* 已结束 */
+        p = p1 + vc * (t - ta);
+    } else if (t < ta + tc + td) {                   /* 减速(S 形): vc → vapp */
+        float u  = (t - ta - tc) / td;
+        float dv = vc - vapp;
+        *v_out = vapp + dv * 0.5f * (1.0f + cosf(PI * u));
+        p = p2 + td * (vapp * u + dv * (u * 0.5f
+                                       + sinf(PI * u) / (2.0f * PI)));
+    } else if (t < ta + tc + td + tapp) {            /* 逼近: 恒 vapp */
+        *v_out = vapp;
+        p = p3 + vapp * (t - ta - tc - td);
+    } else {                                         /* 结束: 停在目标上 */
         *v_out = 0.0f;
-        p = vc * (ta * 0.5f + tc + td * 0.5f);
+        p = p3 + vapp * tapp;
     }
     return p;
 }
@@ -1462,20 +1565,26 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
            另外 `s_tm_t0 == 0` 表示"还没真正起步"(命令下完还要 ALIGN/STARTUP),
            第一拍位置环才锚定时间轴 —— 否则轨迹的参考会在 ALIGN 期间自己跑掉。 */
         if (s_tm_active) {
-            float t, Tm, ta, tc;
+            float t, Tm, ta, tc, td, tapp;
             if (s_tm_t0 == 0U) s_tm_t0 = foc->tick;
             t  = (float)(foc->tick - s_tm_t0) / 20000.0f;
             Tm = (float)s_tm_Ttick / 20000.0f;
-            ta = Tm / POS_TM_PART;
-            tc = Tm - 2.0f * ta;
+            ta   = Tm * POS_TM_TA_FRAC;
+            tc   = Tm * POS_TM_TC_FRAC;
+            td   = Tm * POS_TM_TD_FRAC;
+            tapp = Tm - ta - tc - td;
             if (t < ta) {
                 s_tm_phase = 1U;
-            } else if (t >= (ta + tc)) {
-                s_tm_phase = 9U;
-            } else {
+            } else if (t < (ta + tc)) {
                 float f = (tc > 1.0e-6f) ? ((t - ta) / tc) : 1.0f;
-                uint8_t ph = (uint8_t)(2.0f + f * 7.0f);
-                s_tm_phase = (ph > 8U) ? 8U : ph;
+                uint8_t ph = (uint8_t)(2.0f + f * 4.0f);   /* 匀速 2..6 */
+                s_tm_phase = (ph > 6U) ? 6U : ph;
+            } else if (t < (ta + tc + td)) {
+                s_tm_phase = 7U;                            /* 减速 7 */
+            } else if (t < (ta + tc + td + tapp)) {
+                s_tm_phase = 9U;                            /* 逼近 9 */
+            } else {
+                s_tm_phase = 8U;                            /* 收尾(已到点) */
             }
             if (t >= Tm || fabsf(err) < POS_TM_DONE_DEG) {
                 /* 时间到了 或 已经贴住目标(≈到位死区) ⇒ 交回普通近目标逻辑。
@@ -1584,7 +1693,10 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
             }
         }
 
-        if (s_pos_hold || s_pos_settling || s_pos_frozen) {
+        /* ★★ 2026-10-11ap: 轨迹激活期间这几条全部让位 —— 它们靠读数/测速
+           判"停没停", 而本机这两样在运动中都不可信; 实测 `8` 中段就是被
+           它们抢走控制权后在 ±2.5A 打摆。 */
+        if (!s_tm_active && (s_pos_hold || s_pos_settling || s_pos_frozen)) {
             /* ① 已停在目标齿槽里(hl) 或 ② 刚跨过一条近目标边界(sl, settle):
                一律**完全撤力**(靠齿槽本身保持), 并且不再理会任何速度估计 ——
                这个区间里它们全是尖刺, 一理就自激(含"换向时带旧符号"那一种)。 */
@@ -1644,16 +1756,19 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                 if (s_tm_active) {
                     float t   = (float)(foc->tick - s_tm_t0) / 20000.0f;
                     float Tm  = (float)s_tm_Ttick / 20000.0f;
-                    float ta  = Tm / POS_TM_PART;
-                    float tc  = Tm - 2.0f * ta;
-                    float td  = ta;
+                    float ta  = Tm * POS_TM_TA_FRAC;
+                    float tc  = Tm * POS_TM_TC_FRAC;
+                    float td  = Tm * POS_TM_TD_FRAC;
+                    float tapp = Tm - ta - tc - td;
                     float vp  = 0.0f;
-                    float p   = TM_Profile(t, ta, tc, td, s_tm_vc, &vp);
+                    float p   = TM_Profile4(t, ta, tc, td, tapp,
+                                            s_tm_vc, s_tm_vapp, &vp);
                     float ref = s_tm_deg0 + (float)s_tm_sgn * p;
                     float verr = ref - pos_now_deg;      /* 轨迹位置误差(机械°) */
-                    /* ★★ 2026-10-11am 模型前馈(见 POS_TM_FF_A 注释):
-                       电流 = 磨擦前馈 + a_轨迹×0.0001 + 小权限位置微调,
-                       **不用任何测速** ⇒ 不会有“速度毛刺×增益”的继电器翻转。 */
+                    /* ★★ 2026-10-11am 模型前馈 + 2026-10-11ao 速度相关摩擦
+                       + 阻尼(见 POS_TM_FRIC_* / POS_TM_DAMP_A_PER_DEG_S 注释):
+                       电流 = 摩擦(v_轨迹) + a_轨迹×0.0001 + 位置微调 + 阻尼,
+                       不用任何"实测速度"做增益 ⇒ 不会有毛刺×增益的继电器翻转。 */
                     float v_eff = (float)s_tm_sgn * vp;      /* 规划的机械°/s */
                     float a_eff = 0.0f;
                     if (s_tm_vprev_valid != 0U) {
@@ -1664,18 +1779,61 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                     s_tm_vprev       = v_eff;
                     s_tm_vprev_valid = 1U;
                     {
+                        float vmag = fabsf(v_eff);
                         float iq_f = 0.0f;
-                        float trim;
-                        if (v_eff >  POS_TM_FF_VMIN) iq_f =  POS_TM_FF_A;
-                        if (v_eff < -POS_TM_FF_VMIN) iq_f = -POS_TM_FF_A;
+                        float trim, damp;
+                        /* ① 摩擦前馈: 速度相关(Stribeck) + 符号软过渡 */
+                        if (vmag > 0.01f) {
+                            float fric = POS_TM_FRIC_SLIDE_A
+                                       + (POS_TM_FRIC_STATIC_A - POS_TM_FRIC_SLIDE_A)
+                                         * expf(-vmag / POS_TM_FRIC_V0_DEG_S);
+                            float s = v_eff / POS_TM_FF_SIGN_DEG_S;
+                            if (s >  1.0f) s =  1.0f;
+                            if (s < -1.0f) s = -1.0f;
+                            if (vmag < POS_TM_FF_VMIN) s *= (vmag / POS_TM_FF_VMIN);
+                            iq_f = s * fric;
+                        }
+                        /* ② 位置微调(弹簧): 有权限驱动也**有权限刹车** */
                         trim = POS_TM_P_TRIM_A_PER_DEG * verr;
                         if (trim >  POS_TM_P_TRIM_MAX_A) trim =  POS_TM_P_TRIM_MAX_A;
                         if (trim < -POS_TM_P_TRIM_MAX_A) trim = -POS_TM_P_TRIM_MAX_A;
-                        s_tm_iq = iq_f + POS_TM_A_PER_DEG_S2 * a_eff + trim;
+                        /* ③ 速度阻尼(用模型观测速度, 不用毛刺测速; 自带限幅) */
+                        damp = POS_TM_DAMP_A_PER_DEG_S * (v_eff - s_tm_vobs);
+                        if (damp >  POS_TM_DAMP_MAX_A) damp =  POS_TM_DAMP_MAX_A;
+                        if (damp < -POS_TM_DAMP_MAX_A) damp = -POS_TM_DAMP_MAX_A;
+                        s_tm_iq = iq_f + POS_TM_A_PER_DEG_S2 * a_eff + trim + damp;
                         if (s_tm_iq >  POS_DAMP_MAX_A) s_tm_iq =  POS_DAMP_MAX_A;
                         if (s_tm_iq < -POS_DAMP_MAX_A) s_tm_iq = -POS_DAMP_MAX_A;
+                        /* ④ 驱动侧限流(2026-10-11ap): 见 POS_TM_IQ_DRIVE_MAX_A */
+                        {
+                            float ts = (float)s_tm_sgn;
+                            if (ts * s_tm_iq > POS_TM_IQ_DRIVE_MAX_A) {
+                                s_tm_iq = ts * POS_TM_IQ_DRIVE_MAX_A;
+                            }
+                        }
+                        s_tm_dbg_verr = verr;
+                        s_tm_dbg_ff   = iq_f;
+                        s_tm_dbg_trim = trim + damp;
+                        /* ⑤ 速度观测器更新(用刚算出的指令电流作为模型输入) */
+                        {
+                            float wo    = POS_TM_OBS_WO_RAD_S;
+                            float iq_net = s_tm_iq
+                                         - (float)s_tm_sgn * POS_TM_FRIC_SLIDE_A;
+                            float oerr;
+                            s_tm_vobs   += POS_TM_K_DEG_S2_PER_A * iq_net * dt_s;
+                            s_tm_posobs += s_tm_vobs * dt_s;
+                            oerr = pos_now_deg - s_tm_posobs;
+                            s_tm_posobs += (2.0f * wo) * oerr * dt_s;
+                            s_tm_vobs   += (wo * wo) * oerr * dt_s;
+                            if (s_tm_vobs >  POS_TM_OBS_VMAX_DEG_S) s_tm_vobs =  POS_TM_OBS_VMAX_DEG_S;
+                            if (s_tm_vobs < -POS_TM_OBS_VMAX_DEG_S) s_tm_vobs = -POS_TM_OBS_VMAX_DEG_S;
+                        }
                     }
                     v_tgt = v_eff / 1.5f;    /* 仅供积分开闸/日志参考(不用作电流) */
+                    /* ★★ 2026-10-11ap: 轨迹期间位置积分与爬行状态一律清零 ——
+                       轨迹律是唯一权威, 不许"破齿槽助手"再叠上来。 */
+                    s_pos_integ   = 0.0f;
+                    s_pos_soft_on = 0U;
                 } else {
                     s_tm_vprev_valid = 0U;
                 }
@@ -1746,7 +1904,9 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                      · 误差变小 ⇒ v_cmd=14√d 降下来 ⇒ 速度环给反向力 ⇒ 减速;
                      · 真正的刹车仍可到 2.5A(限幅分档不变)。 */
                 if (s_tm_active) {
-                    /* ★★ 2026-10-11am 轨迹: 直接用模型前馈给出的电流(见 POS_TM_FF_A),
+                    /* ★★ 2026-10-11am 轨迹: 直接用模型前馈给出的电流
+                       (2026-10-11ao: 摩擦前馈按速度成型 + 位置微调 + 阻尼,
+                       见 POS_TM_FRIC_STATIC_A / POS_TM_DAMP_A_PER_DEG_S),
                        不走速度环 —— 本机这个速度段的测速全是毛刺。 */
                     iq_drive = s_tm_iq;
                 } else {
@@ -1788,7 +1948,8 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
 
                 /* ★★ 2026-10-11j 温柔脱困: 近目标 + 基本没动 ⇒ 撤掉速度环驱动,
                    只靠积分慢慢顶(见 POS_GENTLE_ZONE_DEG 注释) */
-                if (fabsf(err) < POS_GENTLE_ZONE_DEG &&
+                if (!s_tm_active &&
+                    fabsf(err) < POS_GENTLE_ZONE_DEG &&
                     fabsf(v) < POS_INTEG_GATE_ERPM) {
                     iq_drive = 0.0f;
                 }
@@ -1848,7 +2009,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                                 }
                             }
                         }
-                    } else if (!s_pos_hop_give && !s_pos_flying &&
+                    } else if (!s_tm_active && !s_pos_hop_give && !s_pos_flying &&
                                (s_pos_soft_end_tick == 0U ||
                                 (foc->tick - s_pos_soft_end_tick) > POS_SOFT_RETRY_TICKS) &&
                                (foc->tick - foc->hall.edge_tick) > POS_SOFT_QUIET_TICKS &&
@@ -1915,6 +2076,16 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
 
             iq_target = iq_drive + s_pos_integ;
 
+            /* ★★ 2026-10-11ap: 轨迹激活期间**跳过**下面全部"实测速度驱动"的
+               旁路逻辑(脱困刹车 / 超速保险 / 破黏脉冲 / 分档限流) ——
+               它们全部依赖 vsp, 而本机这个速度段的 vsp 是毛刺。
+               实测(`8` = 360°/1s) 中段 `Iqref` 在 **±2.50A 之间打摆**、
+               位置读数在 299↔314↔320 之间来回: 就是"超速保险"
+               (`s_pos_flying && |vsp|>250eRPM ⇒ 满刹车`) 在按**假速度**砸电流
+               —— 而转子当时明明还在规划后面(tv=+36°)。轨迹律自己有完整
+               限幅(驱动 ≤POS_TM_IQ_DRIVE_MAX_A, 刹车 ≤POS_DAMP_MAX_A),
+               这里直接跳过 ⇒ "规划 = 唯一权威"。 */
+            if (!s_tm_active) {
             /* ---- 堵转破黏脉冲 ----
                ⚠ 原版只把"上限"抬到 2.5A —— 实测那是**空操作**: 卡住时环路自己
                只出 -1.32A(或更糟的 -0.01A), 本来就低于 1.8A 的原上限, 抬上限
@@ -2041,6 +2212,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                     if (iq_target < -iq_lim) iq_target = -iq_lim;
                 }
             }
+            }   /* ← 2026-10-11ap: 关闭"轨迹期间跳过旁路逻辑" */
         }
 
         /* ★★ 2026-10-11ab 近目标"驱动电流"硬限 —— **本轮抖动的直接主因**:
@@ -2059,7 +2231,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
              · 转子**一动** ⇒ 驱动方向一律 ≤1.30A(再大只会积累冲过目标的动能);
              · 电流**反着**运动方向(真刹车) ⇒ 仍可到 2.5A。
            这条放在最后(压过阻尼/脉冲/脱困刹车/积分), 保证近目标不会"越推越摆"。 */
-        if (fabsf(err) < POS_SOFT_ZONE_DEG && !s_pos_flying) {
+        if (!s_tm_active && fabsf(err) < POS_SOFT_ZONE_DEG && !s_pos_flying) {
             uint8_t quiet   = ((foc->tick - foc->hall.edge_tick) > POS_SOFT_QUIET_TICKS)
                               ? 1U : 0U;
             uint8_t braking = ((fabsf(v) >= POS_CAPTURE_ERPM) &&
@@ -2722,9 +2894,11 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
         LOGD("[TM] already at target (D=%.2fdeg) -> normal hold\r\n", D);
         return;
     }
-    /* 最短用时: ① 加速度上限 ② 巡航(齿槽能擒住)上限 */
-    Tmin_a = sqrtf(15.9f * D / POS_TM_ACC_MAX_DEG_S2);
-    Tmin_v = 9.0f * D / (8.0f * POS_TM_VMAX_MECH_DEG_S);
+    /* 最短用时: ① 加速度上限 ② 巡航上限。
+       ★ 2026-10-11an: 改成 4 段(加速2/9+匀速3/9+减速2/9+逼近2/9)后
+       vc ≈ 1.8·D/T、峰值加速度 ≈ 12.7·D/T² ⇒ 下面两个系数就是该近似。 */
+    Tmin_a = sqrtf(12.7f * D / POS_TM_ACC_MAX_DEG_S2);
+    Tmin_v = 1.8f * D / POS_TM_VMAX_MECH_DEG_S;
     T = (Tmin_a > Tmin_v) ? Tmin_a : Tmin_v;
     if (dur_s < T) {
         LOGW("[TM] %.2fs too short for %.1fdeg -> use %.2fs (accel/capture limit)\r\n",
@@ -2736,22 +2910,51 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
     s_tm_Ttick  = (uint32_t)(T * 20000.0f + 0.5f);
     s_tm_deg0   = pos0;
     s_tm_sgn    = (dist >= 0.0f) ? 1 : -1;
-    s_tm_vc     = 9.0f * D / (8.0f * T);
+    /* ★ 2026-10-11an 4 段: 加速 2/9 + 匀速 3/9 + 减速 2/9 + 逼近 2/9。
+       由 D = vc·(ta/2+tc+td/2) + vapp·(td/2+tapp) 反解 vc。 */
+    {
+        float ta = T * POS_TM_TA_FRAC;
+        float tc = T * POS_TM_TC_FRAC;
+        float td = T * POS_TM_TD_FRAC;
+        float tapp = T - ta - tc - td;
+        float den  = ta * 0.5f + tc + td * 0.5f;
+        float vc   = (D - POS_TM_VAPP_DEG_S * (td * 0.5f + tapp)) / den;
+        if (vc < POS_TM_VAPP_DEG_S) vc = POS_TM_VAPP_DEG_S;   /* 极短行程保底 */
+        s_tm_vapp = POS_TM_VAPP_DEG_S;
+        s_tm_vc   = vc;
+    }
     s_tm_phase  = 1U;
     s_tm_active = 1U;
     s_tm_iq           = 0.0f;   /* 2026-10-11am 模型前馈状态复位 */
     s_tm_vprev       = 0.0f;
     s_tm_vprev_valid = 0U;
-    LOGD("[TM] %.1f -> %.1fdeg (D=%.1f) in %.2fs | accel %.2fs + cruise %.2fs + decel %.2fs | v_cruise=%.1f deg/s (%.0feRPM)\r\n",
+    /* ★ 2026-10-11ao 速度观测器复位(位置也锚到当前读数, 免得第一拍就炸) */
+    s_tm_vobs        = 0.0f;
+    s_tm_posobs      = pos0;
+    s_tm_dbg_verr    = 0.0f;   /* 轨迹诊断清零: 免得上一轮的残留值误导日志 */
+    s_tm_dbg_ff      = 0.0f;
+    s_tm_dbg_trim    = 0.0f;
+    LOGD("[TM] %.1f -> %.1fdeg (D=%.1f) in %.2fs | accel %.2fs + cruise %.2fs + decel %.2fs + creep %.2fs | v_cruise=%.1f -> v_app=%.1f deg/s\r\n",
          pos0, foc->pos_target_deg_cmd, D, T,
-         T / POS_TM_PART, T - 2.0f * (T / POS_TM_PART), T / POS_TM_PART,
-         s_tm_vc, s_tm_vc / 1.5f);
+         T * POS_TM_TA_FRAC, T * POS_TM_TC_FRAC, T * POS_TM_TD_FRAC,
+         T * (1.0f - POS_TM_TA_FRAC - POS_TM_TC_FRAC - POS_TM_TD_FRAC),
+         s_tm_vc, s_tm_vapp);
 }
 
 /* 0 = 未在跑定时轨迹; 1..9 = 当前处于第几份(1=加速, 9=减速) */
 uint8_t FOC_Control_GetTimedPhase(void)
 {
     return s_tm_active ? s_tm_phase : 0U;
+}
+
+/* ★ 2026-10-11ao 轨迹诊断(仅日志用): tv=轨迹位置误差(°), ff=摩擦前馈(A),
+   tr=位置微调+阻尼(A), vob=观测速度(°/s)。判断“环是不是又在饱和打摆”。 */
+void FOC_Control_GetTrajDiag(float *verr, float *iq_ff, float *iq_trim, float *vobs)
+{
+    if (verr    != 0) *verr    = s_tm_dbg_verr;
+    if (iq_ff   != 0) *iq_ff   = s_tm_dbg_ff;
+    if (iq_trim != 0) *iq_trim = s_tm_dbg_trim;
+    if (vobs    != 0) *vobs    = s_tm_vobs;
 }
 
 /* 位置环积分项(A) — 只给日志看, 判断"是不是靠积分顶着静摩擦" */
