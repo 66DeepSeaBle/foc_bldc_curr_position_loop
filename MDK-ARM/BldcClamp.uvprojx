@@ -340,7 +340,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32G431xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32G4xx_HAL_Driver/Inc;../Drivers/STM32G4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32G4xx/Include;../Drivers/CMSIS/Include;../Middlewares/SEGGER_RTT</IncludePath>
+              <IncludePath>../Core/Inc;../Core/bsp;../Core/foc;../Core/app;../Drivers/STM32G4xx_HAL_Driver/Inc;../Drivers/STM32G4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32G4xx/Include;../Drivers/CMSIS/Include;../Middlewares/SEGGER_RTT</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -392,57 +392,12 @@
           </Files>
         </Group>
         <Group>
-          <GroupName>Application/User/Core</GroupName>
+          <GroupName>Application/Core</GroupName>
           <Files>
             <File>
-              <FileName>gpio.c</FileName>
+              <FileName>main.c</FileName>
               <FileType>1</FileType>
-              <FilePath>../Core/Src/gpio.c</FilePath>
-            </File>
-            <File>
-              <FileName>adc.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/adc.c</FilePath>
-            </File>
-            <File>
-              <FileName>tim.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/tim.c</FilePath>
-            </File>
-            <File>
-              <FileName>usart.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/usart.c</FilePath>
-            </File>
-            <File>
-              <FileName>vofa.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/vofa.c</FilePath>
-            </File>
-            <File>
-              <FileName>app.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/app.c</FilePath>
-            </File>
-            <File>
-              <FileName>bsp_stm32g4.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/bsp_stm32g4.c</FilePath>
-            </File>
-            <File>
-              <FileName>sensor_hall.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/sensor_hall.c</FilePath>
-            </File>
-            <File>
-              <FileName>sensor_encoder.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/sensor_encoder.c</FilePath>
-            </File>
-            <File>
-              <FileName>opamp.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>../Core/Src/opamp.c</FilePath>
+              <FilePath>../Core/Src/main.c</FilePath>
             </File>
             <File>
               <FileName>stm32g4xx_it.c</FileName>
@@ -454,50 +409,120 @@
               <FileType>1</FileType>
               <FilePath>../Core/Src/stm32g4xx_hal_msp.c</FilePath>
             </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>bsp</GroupName>
+          <Files>
             <File>
-              <FileName>angle_observer.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\angle_observer.c</FilePath>
+              <FileName>board_config.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../Core/bsp/board_config.h</FilePath>
             </File>
             <File>
-              <FileName>current_loop.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\current_loop.c</FilePath>
+              <FileName>bsp.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>../Core/bsp/bsp.h</FilePath>
             </File>
+            <File>
+              <FileName>bsp_stm32g4.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/bsp/bsp_stm32g4.c</FilePath>
+            </File>
+            <File>
+              <FileName>gpio.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/bsp/gpio.c</FilePath>
+            </File>
+            <File>
+              <FileName>adc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/bsp/adc.c</FilePath>
+            </File>
+            <File>
+              <FileName>tim.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/bsp/tim.c</FilePath>
+            </File>
+            <File>
+              <FileName>usart.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/bsp/usart.c</FilePath>
+            </File>
+            <File>
+              <FileName>opamp.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/bsp/opamp.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>foc</GroupName>
+          <Files>
             <File>
               <FileName>foc_control.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Core\Src\foc_control.c</FilePath>
-            </File>
-            <File>
-              <FileName>main.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\main.c</FilePath>
+              <FilePath>../Core/foc/foc_control.c</FilePath>
             </File>
             <File>
               <FileName>pid.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Core\Src\pid.c</FilePath>
-            </File>
-            <File>
-              <FileName>position_loop.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\position_loop.c</FilePath>
-            </File>
-            <File>
-              <FileName>pwm_output.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\pwm_output.c</FilePath>
-            </File>
-            <File>
-              <FileName>speed_loop.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\Core\Src\speed_loop.c</FilePath>
+              <FilePath>../Core/foc/pid.c</FilePath>
             </File>
             <File>
               <FileName>transform.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\Core\Src\transform.c</FilePath>
+              <FilePath>../Core/foc/transform.c</FilePath>
+            </File>
+            <File>
+              <FileName>current_loop.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/foc/current_loop.c</FilePath>
+            </File>
+            <File>
+              <FileName>speed_loop.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/foc/speed_loop.c</FilePath>
+            </File>
+            <File>
+              <FileName>position_loop.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/foc/position_loop.c</FilePath>
+            </File>
+            <File>
+              <FileName>pwm_output.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/foc/pwm_output.c</FilePath>
+            </File>
+            <File>
+              <FileName>angle_observer.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/foc/angle_observer.c</FilePath>
+            </File>
+            <File>
+              <FileName>sensor_hall.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/foc/sensor_hall.c</FilePath>
+            </File>
+            <File>
+              <FileName>sensor_encoder.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/foc/sensor_encoder.c</FilePath>
+            </File>
+          </Files>
+        </Group>
+        <Group>
+          <GroupName>app</GroupName>
+          <Files>
+            <File>
+              <FileName>app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/app/app.c</FilePath>
+            </File>
+            <File>
+              <FileName>vofa.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/app/vofa.c</FilePath>
             </File>
           </Files>
         </Group>
