@@ -1,14 +1,15 @@
 /**
   * @file    foc_control.c
-  * @brief   FOC???????
+  * @brief   FOC 控制核心: 状态机 + 电流/速度/位置环 + 定时轨迹
   */
 #include "foc_control.h"
 #include "transform.h"
 #include "pid.h"
+#include "sensor.h"      /* 位置传感器抽象: ALIGN 零点标定走 g_sensor(换编码器不用改这里) */
 #include "log.h"
 #include <math.h>
 
-/* ---- ?????? ---- */
+/* ---- 各状态的执行体(每拍一个) ---- */
 static void FOC_DoIdle(FOC_Control_t *foc);
 static void FOC_DoAlign(FOC_Control_t *foc, float dt_s);
 static void FOC_DoStartup(FOC_Control_t *foc, float dt_s);
@@ -343,7 +344,7 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
            "给了 1.2A 电流, 电机一动不动、Pos 冻结、fb=0"。
            此时保留上一次的 offset 并报警。 */
         if (foc->hall.state >= 1U && foc->hall.state <= 6U) {
-            AngleObserver_CalibrateOffsetAtZero(&foc->angle, foc->hall.state);
+            g_sensor.CalibrateAtZero(foc, foc->hall.state);
             LOGD("[ALIGN] Align done, hall=%d -> offset calibrated %.1fdeg\r\n",
                  (int)foc->hall.state,
                  foc->angle.offset * 57.29577951f);
@@ -2911,16 +2912,29 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
     s_tm_deg0   = pos0;
     s_tm_sgn    = (dist >= 0.0f) ? 1 : -1;
     /* ★ 2026-10-11an 4 段: 加速 2/9 + 匀速 3/9 + 减速 2/9 + 逼近 2/9。
-       由 D = vc·(ta/2+tc+td/2) + vapp·(td/2+tapp) 反解 vc。 */
+       由 D = vc·(ta/2+tc+td/2) + vapp·(td/2+tapp) 反解 vc。
+       ★★ 2026-10-17 短行程修正: 以前 vc 低于 vapp 时直接把 vc 钳到 vapp,
+       但那样**总行程就超过 D 了** —— 例: T=1.5s、D=45° 时钳位后实际走
+       40×(ta/2+tc+td/2) + 40×(td/2+tapp) = 40×1.333 = 53.3° > 45°,
+       即轨迹自己会多冲 8°。现在改成“短行程时按比例降 vapp”, 两边同时缩,
+       保证总行程严格等于 D。 (vc=vapp 时的最小行程 = vapp×1.333s) */
     {
         float ta = T * POS_TM_TA_FRAC;
         float tc = T * POS_TM_TC_FRAC;
         float td = T * POS_TM_TD_FRAC;
         float tapp = T - ta - tc - td;
         float den  = ta * 0.5f + tc + td * 0.5f;
-        float vc   = (D - POS_TM_VAPP_DEG_S * (td * 0.5f + tapp)) / den;
-        if (vc < POS_TM_VAPP_DEG_S) vc = POS_TM_VAPP_DEG_S;   /* 极短行程保底 */
-        s_tm_vapp = POS_TM_VAPP_DEG_S;
+        float dmin_k = ta * 0.5f + tc + td + tapp;      /* = T - ta/2 */
+        float vapp = POS_TM_VAPP_DEG_S;
+        float vc;
+
+        if (D < vapp * dmin_k) {
+            vapp = D / dmin_k;                          /* 短行程: 等比例降逼近速度 */
+            if (vapp < 1.0f) vapp = 1.0f;
+        }
+        vc = (D - vapp * (td * 0.5f + tapp)) / den;
+        if (vc < vapp) vc = vapp;
+        s_tm_vapp = vapp;
         s_tm_vc   = vc;
     }
     s_tm_phase  = 1U;

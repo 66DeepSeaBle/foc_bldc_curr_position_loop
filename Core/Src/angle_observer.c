@@ -1,6 +1,6 @@
 /**
   * @file    angle_observer.c
-  * @brief   ?????????
+  * @brief   角度观测器实现(数字霍尔: 扇区 + 扇区内插值 + 模型外推)
   */
 #include "angle_observer.h"
 #include <math.h>

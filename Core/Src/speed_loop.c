@@ -1,6 +1,6 @@
 /**
   * @file    speed_loop.c
-  * @brief   ?????
+  * @brief   速度环实现
   */
 #include "speed_loop.h"
 #include <math.h>

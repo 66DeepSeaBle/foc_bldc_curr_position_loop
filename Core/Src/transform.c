@@ -1,6 +1,6 @@
 /**
   * @file    transform.c
-  * @brief   ??????
+  * @brief   坐标变换实现(Clarke / Park / 逆变换)
   */
 #include "transform.h"
 #include <math.h>

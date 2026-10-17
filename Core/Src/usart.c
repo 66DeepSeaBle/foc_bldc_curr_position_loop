@@ -19,6 +19,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "usart.h"
+#include "board_config.h"   /* 串口实例/波特率/引脚/DMA/中断号全部来自这里 */
 
 /* USER CODE BEGIN 0 */
 
@@ -33,11 +34,12 @@ DMA_HandleTypeDef hdma_usart2_tx;
    注意：PB3/PB4 复位后默认是 JTAG(JTDO/NJTRST)，配成 AF7 即可覆盖，
    SWD 调试用的是 PA13/PA14，不受影响。
    TX 挂了DMA：VOFA波形帧靠 HAL_UART_Transmit_DMA 发送，主循环不用等
-   传输完成，能更及时地跑速度环/读霍尔。 */
+   传输完成，能更及时地跑速度环/读霍尔。
+   ★ 本函数里的硬件常量全部来自 board_config.h 的 CFG_UART_*, 换串口只改那里。 */
 void MX_USART2_UART_Init(void)
 {
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 9600;
+  CFG_UART_HANDLE.Instance = CFG_UART_INSTANCE;
+  CFG_UART_HANDLE.Init.BaudRate = CFG_UART_BAUD;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
   huart2.Init.StopBits = UART_STOPBITS_1;
   huart2.Init.Parity = UART_PARITY_NONE;
@@ -70,36 +72,44 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
-  if(uartHandle->Instance==USART2)
+  if(uartHandle->Instance==CFG_UART_INSTANCE)
   {
   /* USER CODE BEGIN USART2_MspInit 0 */
 
+    /* 串口时钟源: 必须与实际使用的串口对应(换 USART1 时这里自动跟着变) */
+#if (CFG_UART_NUM == 2)
     PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART2;
     PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
+#elif (CFG_UART_NUM == 1)
+    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1;
+    PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
+#else
+#error "board_config.h: 这个串口实例还没在本文件里加时钟源分支"
+#endif
     if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
     {
       Error_Handler();
     }
 
     __HAL_RCC_USART2_CLK_ENABLE();
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    /**USART2 GPIO Configuration
+    __HAL_RCC_GPIOB_CLK_ENABLE();   /* 注: gpio.c 已把 A/B/C/F 时钟全开了, 这里保留无害 */
+    /**USART2 GPIO Configuration (引脚/复用号来自 board_config.h)
     PB3     ------> USART2_TX
     PB4     ------> USART2_RX
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_4;
+    GPIO_InitStruct.Pin = CFG_UART_TX_PIN|CFG_UART_RX_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    GPIO_InitStruct.Alternate = GPIO_AF7_USART2;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+    GPIO_InitStruct.Alternate = CFG_UART_AF;
+    HAL_GPIO_Init(CFG_UART_GPIO_PORT, &GPIO_InitStruct);
 
     /* USART2_TX DMA Init */
     __HAL_RCC_DMAMUX1_CLK_ENABLE();
     __HAL_RCC_DMA1_CLK_ENABLE();
 
-    hdma_usart2_tx.Instance = DMA1_Channel1;
-    hdma_usart2_tx.Init.Request = DMA_REQUEST_USART2_TX;
+    hdma_usart2_tx.Instance = CFG_UART_DMA_INSTANCE;
+    hdma_usart2_tx.Init.Request = CFG_UART_DMA_REQUEST;
     hdma_usart2_tx.Init.Direction = DMA_MEMORY_TO_PERIPH;
     hdma_usart2_tx.Init.PeriphInc = DMA_PINC_DISABLE;
     hdma_usart2_tx.Init.MemInc = DMA_MINC_ENABLE;
@@ -114,16 +124,16 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
 
     __HAL_LINKDMA(uartHandle, hdmatx, hdma_usart2_tx);
 
-    HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 1, 0);
-    HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+    HAL_NVIC_SetPriority(CFG_UART_DMA_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(CFG_UART_DMA_IRQn);
 
     /* USART2全局中断：DMA把最后一个字节搬进TDR之后，HAL会转去开
        USART自己的"发送完成"(TC)中断，等移位寄存器真正把最后一位推出去
        才把gState翻回READY——这个中断必须在NVIC里使能，否则gState永远
-       卡在BUSY，第一帧发完之后Vofa_Send3就会一直判断"没就绪"而跳过，
-       串口看起来像是卡死/只收到一帧。 */
-    HAL_NVIC_SetPriority(USART2_IRQn, 1, 0);
-    HAL_NVIC_EnableIRQ(USART2_IRQn);
+       卡在BUSY，第一帧发完之后 vofa.c 的 VOFA_Send 就会一直判断"没就绪"
+       而跳过，串口看起来像是卡死/只收到一帧。 */
+    HAL_NVIC_SetPriority(CFG_UART_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(CFG_UART_IRQn);
 
   /* USER CODE END USART2_MspInit 0 */
   }

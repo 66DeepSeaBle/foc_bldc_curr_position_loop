@@ -1,6 +1,6 @@
 /**
   * @file    position_loop.h
-  * @brief   ???P?? + ?????? ??
+  * @brief   位置环: P 控制 + 限速 + 到位判断
   */
 #ifndef POSITION_LOOP_H
 #define POSITION_LOOP_H

@@ -1,6 +1,6 @@
 /**
   * @file    current_loop.c
-  * @brief   ?????
+  * @brief   电流环实现(d/q 双 PI, 输出占空比量)
   */
 #include "current_loop.h"
 #include "pid.h"

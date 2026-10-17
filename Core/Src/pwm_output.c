@@ -1,14 +1,11 @@
 /**
   * @file    pwm_output.c
-  * @brief   SVPWM??
+  * @brief   SVPWM 调制实现(七段式, 含死区补偿)
   */
 #include "pwm_output.h"
 #include "transform.h"
+#include "bsp.h"          /* 执行器输出: 占空比下发/关断都走 BSP(换芯片不用改这里) */
 #include <math.h>
-
-/* ---- ??????? (?main.c??????) ---- */
-extern void MotorSetDuty3(float du, float dv, float dw);
-extern void MotorAllOff(void);
 
 static float dt_comp_duty = 0.0f;
 static float iu_filt = 0.0f, iv_filt = 0.0f, iw_filt = 0.0f;
@@ -77,7 +74,7 @@ void PWM_Output_SVPWM(SVPWM_t *pwm, float valpha, float vbeta,
 
 void PWM_Output_Apply(const SVPWM_t *pwm)
 {
-    MotorSetDuty3(pwm->du, pwm->dv, pwm->dw);
+    BSP_PWM_SetDuty3(pwm->du, pwm->dv, pwm->dw);
 }
 
 float PWM_Output_GetDu(const SVPWM_t *pwm) { return pwm->du; }
@@ -86,6 +83,6 @@ float PWM_Output_GetDw(const SVPWM_t *pwm) { return pwm->dw; }
 
 void PWM_Output_Disable(void)
 {
-    MotorAllOff();
+    BSP_PWM_Off();
 }
 

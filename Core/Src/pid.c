@@ -1,6 +1,6 @@
 /**
   * @file    pid.c
-  * @brief   PID??? + ????? ??
+  * @brief   PID 调节器 + 一阶低通滤波器实现
   */
 #include "pid.h"
 #include <math.h>

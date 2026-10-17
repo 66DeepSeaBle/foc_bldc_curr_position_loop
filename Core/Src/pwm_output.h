@@ -1,6 +1,6 @@
 /**
   * @file    pwm_output.h
-  * @brief   SVPWM + ???? + ????? ??
+  * @brief   SVPWM 调制 + 占空比输出 + 死区补偿
   */
 #ifndef PWM_OUTPUT_H
 #define PWM_OUTPUT_H

@@ -1,6 +1,6 @@
 /**
   * @file    pid.h
-  * @brief   PID??? + ????? ??
+  * @brief   PID 调节器 + 一阶低通滤波器
   */
 #ifndef PID_H
 #define PID_H

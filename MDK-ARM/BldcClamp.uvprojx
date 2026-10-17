@@ -415,6 +415,31 @@
               <FilePath>../Core/Src/usart.c</FilePath>
             </File>
             <File>
+              <FileName>vofa.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/vofa.c</FilePath>
+            </File>
+            <File>
+              <FileName>app.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/app.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_stm32g4.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/bsp_stm32g4.c</FilePath>
+            </File>
+            <File>
+              <FileName>sensor_hall.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/sensor_hall.c</FilePath>
+            </File>
+            <File>
+              <FileName>sensor_encoder.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/sensor_encoder.c</FilePath>
+            </File>
+            <File>
               <FileName>opamp.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/opamp.c</FilePath>
