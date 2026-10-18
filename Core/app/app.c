@@ -34,7 +34,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-17 app-layer-split"
+#define FW_BUILD_TAG  "2026-10-18 cal30 quiet120 vapp28 tm085"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U
@@ -453,15 +453,33 @@ static void App_HandleKey(int ch)
     } else if (ch == 'k' || ch == 'K') {
         FOC_Control_SetTorqueProbe(&g_foc, -2.5f, 600);   /* -Iq 探针 */
     } else if (ch >= '0' && ch <= '9') {
-        /* 数字键 = 45°×n。≤360° 统一走定时轨迹(旧的速度环律在齿槽上是一跳一跳的) */
+        /* 数字键 = 45°×n。
+           ★★★ cal20 (2026-10-18) —— **一律走定时轨迹**。
+           原来 `|de| > 360.5°` 就退回 `SetPosTarget`(老的单扇区爬行律,
+           Iqref 在 ±2.5A 之间打摆)。而转子在 360° 附近几乎总是停在
+           360.6~361.6°(超调), 于是按 `0` 时 de = -361.x° **必然** > 360.5
+           ⇒ 每次都掉进老律 —— 这就是"输入 0 转动不平滑"的唯一原因。
+           日志铁证(好几个版本都一样):
+             [CMD] Set target 0.0deg | now=360.65 err=-360.65 -> moving
+           上面**没有 [TM] 行** ⇒ 轨迹根本没启动。
+           SetTimedTarget 自己会处理 D<1°(already at target) 与 T 太短的情况,
+           所以不需要这个门。 */
         float target = (float)(ch - '0') * 45.0f;
         float now_deg = g_sensor.GetMechDeg(&g_foc);
         float de = target - now_deg;
-
-        if (fabsf(de) <= 360.5f) {
-            FOC_Control_SetTimedTarget(&g_foc, target, FOC_POS_DEFAULT_TM_S);
-        } else {
-            FOC_Control_SetPosTarget(&g_foc, target);
+        /* ★ cal20: 时间按行程比例给, 让"巡航速度"大致恒定, 而不是固定 1.5s
+           (固定 1.5s 时 360° 只有 416°/s、45° 只有 38°/s, 都在齿槽"一顿一顿"
+            的区间; 速度越慢越一顿)。分档参考:
+              |de|=360° ⇒ 1.00s ⇒ v≈632°/s    ← 用户实测"平滑很多"
+              |de|= 90° ⇒ 0.35s ⇒ v≈410°/s
+              |de|= 45° ⇒ 0.35s ⇒ v≈250°/s
+           短行程到不了高速是"4 段轨迹 + 加速度上限 8000°/s²"的物理限制,
+           不是参数能解决的(要根治只能加齿槽补偿表或换磁编码器)。 */
+        {
+            float dur = fabsf(de) / 360.0f;
+            if (dur < 0.35f) dur = 0.35f;
+            if (dur > FOC_POS_DEFAULT_TM_S) dur = FOC_POS_DEFAULT_TM_S;
+            FOC_Control_SetTimedTarget(&g_foc, target, dur);
         }
         /* 把按键那一瞬的位置/误差一起打出来: 反复出现的"按了没动"多数是
            "本来就在容差内"(位置环在 |err|<容差 时故意撤力矩)。 */
@@ -672,11 +690,15 @@ void App_OnCurrentSample(void)
     }
 }
 
-/* 1kHz: VOFA 波形一帧(通道: Iu, Iv, Iw, Pos) */
+/* 1kHz: VOFA 波形一帧(通道: Iu, Iv, Iw, Spd(°/s), Pos(°)) */
 void App_OnWaveTick(void)
 {
     if (VOFA_GetEnable()) {
-        VOFA_Send4(g_foc.current.u, g_foc.current.v, g_foc.current.w,
+        /* ★ 速度: FOC_Control_GetPosErpm() 是 eRPM; 本机 4 对极 ⇒
+           1 eRPM = 360°/60s/pp = 1.5 机械°/s, 所以 ×1.5 就是 °/s。
+           想改看 Iq/Iqref 就把下面任一个换掉(它们才是能看出控制动作的量)。 */
+        VOFA_Send5(g_foc.current.u, g_foc.current.v, g_foc.current.w,
+                   FOC_Control_GetPosErpm() * 1.5f,
                    g_sensor.GetMechDeg(&g_foc));
     }
 }
@@ -702,7 +724,7 @@ static void App_PrintKeys(void)
     LOGD("[MAIN] Keys: s=auto V/f test  p=PWM smoke test  r=re-align  D=dir_rev(cap)  y=torque\r\n");
     LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  z=target 0  0~9=digit*45deg(auto-start)  c=hall verify\r\n");
     LOGD("[MAIN] Keys: t<deg> d<sec> + Enter = TIMED move (accel/cruise/decel/creep = 2/9,3/9,2/9,2/9)\r\n");
-    LOGD("[MAIN] Keys: 0~9/z default timed move: |d|<=360deg in %.1fs\r\n",
+    LOGD("[MAIN] Keys: 0~9/z default timed move: any angle in %.1fs (ramp-to-zero)\r\n",
          (double)FOC_POS_DEFAULT_TM_S);
     LOGD("[MAIN] Keys: v=verbose log(25ms)  w=VOFA wave on/off\r\n");
     LOGD("[ANG] idx,state,hall,synced,elec_deg,mech_deg,erpm\r\n");
@@ -763,9 +785,75 @@ void App_Init(void)
     if (!BSP_WaveTimer_Start()) {
         LOGW("[VOFA] wave timer start failed -> no waveform output\r\n");
     } else {
-        LOGD("[VOFA] wave ON: UART @ %ubps, JustFloat %uch = Iu,Iv,Iw,Pos, %uHz DMA\r\n",
+        LOGD("[VOFA] wave ON: UART @ %ubps, FireWater %uch = Iu,Iv,Iw,Spd(deg/s),Pos, %uHz DMA (text, CRLF)\r\n",
              (unsigned)CFG_UART_BAUD, (unsigned)VOFA_CHANNELS,
              (unsigned)CFG_WAVE_RATE_HZ);
+    }
+}
+
+/* ==========================================================================
+ * 中断负载率报告(见 bsp.h 的 BSP_Prof_*)
+ * --------------------------------------------------------------------------
+ * 只走 RTT, 不上 VOFA。每秒一条。
+ *   负载 = 该中断在窗口内花费的周期 / 窗口总周期。
+ *   ⚠ 若 TIM6 优先级高于 ADC, 且两者相邻触发, ADC 测得的时间会包含 TIM6
+ *     的耗时(保守偏大)。看"总和"是否 <100% 就能判断有没有溢出。
+ * ========================================================================== */
+static uint32_t App_CycToUsX100(uint32_t cyc)
+{
+    /* 周期数 → 1/100 微秒。 SystemCoreClock = 170000000 ⇒ 170 周期/us */
+    uint32_t mhz = (uint32_t)(SystemCoreClock / 1000000U);
+    if (mhz == 0U) { mhz = 170U; }
+    return (uint32_t)(((unsigned long long)cyc * 100ULL) / (unsigned long long)mhz);
+}
+
+static void App_ReportProf(uint32_t now)
+{
+    static uint32_t s_pf_last_ms = 0U;
+    static uint32_t s_pf_drop    = 0U;      /* ★ cal29: 上一窗口的 RTT 丢行数 */
+    BSP_Prof_t p;
+
+    if ((now - s_pf_last_ms) < 1000U) {
+        return;
+    }
+    s_pf_last_ms = now;
+
+    BSP_Prof_Take(&p);
+    if ((p.win_cycles == 0U) || (p.isr_count == 0U)) {
+        return;
+    }
+    {
+        unsigned long long w   = (unsigned long long)p.win_cycles;
+        uint32_t isr_pm = (uint32_t)((unsigned long long)p.isr_cycles * 10000ULL / w);
+        uint32_t wav_pm = (uint32_t)((unsigned long long)p.wav_cycles * 10000ULL / w);
+        uint32_t idl_pm = (isr_pm + wav_pm < 10000U) ? (10000U - isr_pm - wav_pm) : 0U;
+        uint32_t clk1000 = (uint32_t)(SystemCoreClock / 1000U);
+        uint32_t isr_avg = (p.isr_count != 0U) ? (p.isr_cycles / p.isr_count) : 0U;
+        uint32_t wav_avg = (p.wav_count != 0U) ? (p.wav_cycles / p.wav_count) : 0U;
+        uint32_t rtt_now = BSP_Log_GetRttDrop();
+        uint32_t rtt_drop = rtt_now - s_pf_drop;   /* 本窗口(1s)丢掉的行数 */
+        s_pf_drop = rtt_now;
+
+        LOGD("[PROF] win=%lums | FOC@20k n=%lu load=%lu.%02lu%% tot=%lums avg=%lu.%02luus max=%lu.%02luus"
+             " | VOFA@1k n=%lu load=%lu.%02lu%% tot=%lums avg=%lu.%02luus max=%lu.%02luus"
+             " | idle=%lu.%02lu%% | rttdrop=%lu\r\n",
+             (unsigned long)(p.win_cycles / clk1000),
+             (unsigned long)p.isr_count,
+             (unsigned long)(isr_pm / 100U), (unsigned long)(isr_pm % 100U),
+             (unsigned long)(p.isr_cycles / clk1000),
+             (unsigned long)(App_CycToUsX100(isr_avg) / 100U),
+             (unsigned long)(App_CycToUsX100(isr_avg) % 100U),
+             (unsigned long)(App_CycToUsX100(p.isr_max) / 100U),
+             (unsigned long)(App_CycToUsX100(p.isr_max) % 100U),
+             (unsigned long)p.wav_count,
+             (unsigned long)(wav_pm / 100U), (unsigned long)(wav_pm % 100U),
+             (unsigned long)(p.wav_cycles / clk1000),
+             (unsigned long)(App_CycToUsX100(wav_avg) / 100U),
+             (unsigned long)(App_CycToUsX100(wav_avg) % 100U),
+             (unsigned long)(App_CycToUsX100(p.wav_max) / 100U),
+             (unsigned long)(App_CycToUsX100(p.wav_max) % 100U),
+             (unsigned long)(idl_pm / 100U), (unsigned long)(idl_pm % 100U),
+             (unsigned long)rtt_drop);
     }
 }
 
@@ -774,6 +862,7 @@ void App_Loop(void)
     uint32_t now = BSP_Time_Ms();
 
     App_PollKeys();
+    BSP_Log_DeferFlush();      /* ★ cal25: 把中断里攒下的日志一次性写出 */
     App_ReportSlow(now);
 
     /* 手动盘轴验证: 高频采样(2ms), 不打常规状态行 */
@@ -784,5 +873,6 @@ void App_Loop(void)
     }
 
     App_ReportMain(now);
+    App_ReportProf(now);
     BSP_Time_DelayMs(10);
 }

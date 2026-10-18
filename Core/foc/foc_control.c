@@ -16,6 +16,7 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s);
 static void FOC_DoCurrentLoop(FOC_Control_t *foc, float dt_s);
 static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s);
 static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s);
+static void TM_ExpInit(void);          /* 摩擦前馈 exp 查表初始化(定义在文件后半) */
 static void FOC_DoBrake(FOC_Control_t *foc, float dt_s);
 static void FOC_DoFault(FOC_Control_t *foc);
 static void FOC_DoOpenLoop(FOC_Control_t *foc, float dt_s);
@@ -77,6 +78,12 @@ static uint32_t s_man_oc_cnt = 0;
 void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
 {
     foc->config = *config;
+
+    /* ★ 初始化正弦查表(Park/逆Park/TM_Profile4 都用它)。
+       必须在任何控制中断启动之前调 —— 万一忘了, FOC_SinCos 里有兜底自动初始化,
+       但那第一拍会多花 ~0.5ms。 */
+    FOC_Math_Init();
+    TM_ExpInit();          /* ★ 建议③: 摩擦前馈的 exp 查表 */
 
     foc->flags.enabled = 0;
     foc->flags.aligned = 0;
@@ -311,7 +318,7 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
 
     if (foc->align_tick == 0) {
         foc->align_tick = foc->tick;
-        LOGD("[ALIGN] Starting alignment, Id=%.1fA\n", align_current);
+        LOGD("[ALIGN] Starting alignment, Id=%dmA\n", (int)(align_current * 1000.0f));
         foc->current_loop.id_ref = align_current;
         foc->current_loop.iq_ref = 0.0f;
     }
@@ -345,9 +352,9 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
            此时保留上一次的 offset 并报警。 */
         if (foc->hall.state >= 1U && foc->hall.state <= 6U) {
             g_sensor.CalibrateAtZero(foc, foc->hall.state);
-            LOGD("[ALIGN] Align done, hall=%d -> offset calibrated %.1fdeg\r\n",
+            LOGD("[ALIGN] Align done, hall=%d -> offset=%dmdeg\r\n",
                  (int)foc->hall.state,
-                 foc->angle.offset * 57.29577951f);
+                 (int)(foc->angle.offset * 57295.77951f));
         } else {
             /* 2026-10-01 ★★★ 必须直接停机, 不能继续往下跑!
                没有正确的 offset, theta 就是错的 ⇒ 电流矢量方向错 ⇒ 位置环
@@ -382,7 +389,7 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
 
     if (foc->startup_tick == 0) {
         foc->startup_tick = foc->tick;
-        LOGD("[STARTUP] I-F startup, target %.1fHz\n", target_hz);
+        LOGD("[STARTUP] I-F startup, target=%dmHz\n", (int)(target_hz * 1000.0f));
     }
 
     elapsed = foc->tick - foc->startup_tick;
@@ -452,7 +459,8 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
         if (!foc->pos_target_user_set) {
             foc->pos_target_deg_cmd = pos;
         }
-        LOGD("[STARTUP] Synced erpm=%.0f hold@%.1fdeg\n", erpm, pos);
+        LOGD("[STARTUP] Synced erpm=%d hold@%dmdeg\n",
+             (int)erpm, (int)(pos * 1000.0f));
         return;
     }
 
@@ -626,11 +634,41 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
 /* ★★ 2026-10-11ah 9→13: 死区一旦进入(hl=1)就**不该**被半个扇区的读数
    抖动叫醒 —— 恰恰是它把 Tgt=0 那一份日志救成了完全安静的(hl=1/Iqref=0.00/
    dte 一直涨)。13 < 一格齿槽(15.47) ⇒ 真的丢了一格仍然会醒过来修。 */
-#define POS_HOLD_OUT_DEG     13.0f
-/* 进入死区前 "|err| 连续在容差内" 的时长. 用**时间**而不是瞬时速度判断
+#define POS_HOLD_OUT_DEG     13.0f/* 进入死区前 "|err| 连续在容差内" 的时长. 用**时间**而不是瞬时速度判断
    "停下来了没有" —— 因为本机速度反馈在目标附近全是尖刺, 用不了。
    飞掠(300~600°/s)穿过 ±6° 只停 ~40ms, 而真停住会持续几百ms ✓ 区分得开。 */
 #define POS_HOLD_SETTLE_TICKS (100U * 20U)
+
+/* ★★★ cal25 位置律分频（省 CPU）
+ * --------------------------------------------------------------------------
+ * 实测(cal23 [PROF]): 20kHz 每拍 24.7us(保持) / 35us(运动), 其中:
+ *     st=0(只跑外壳+DoIdle)  = 4.15us
+ *     st=5(角度+位置律+电流环) = 24.66us
+ * ⇒ **位置律那一大坨(几十个 if/else、观测器、爬行、冻结判定)占 20us**,
+ *   而它的物理带宽只有 3Hz —— 根本没道理跑 20kHz。
+ *
+ * 现在把它降为 20kHz / POS_LAW_DIV = 10kHz（可改成 5kHz 用 4）。
+ * **下面这些仍然保持 20kHz**（它们依赖 20kHz 的时间分辨率，不能降）:
+ *   · FOC_UpdateAngle()      → 电流环的 Park 角度，必须每拍更新
+ *   · 霍尔边沿计数 s_pos_win10_edges / s_pos_dir_run
+ *   · 10ms 位置差分测速窗
+ *   · s_pos_erpm_filt 低通（τ=12ms，降频会变成 24ms）
+ *   · 100ms 扇区计数窗 / 跑飞保护 / 堆转看门狗
+ * 跳过的拍只跑 FOC_UpdateCurrent()，iq_ref 沿用上一拍（电流环仍 20kHz）。
+ *
+ * 所有 tick 计时器（POS_*_TICKS）不受影响 —— foc->tick 还是在
+ * FOC_Control_Run 里每拍 +1。需要一键回到原行为: 改成 1U。
+ * -------------------------------------------------------------------------- */
+#ifndef POS_LAW_DIV
+#define POS_LAW_DIV 2U
+#endif
+
+/* ★ cal26: 判定"已经滑走一个齿槽"的门限(机械°)。
+   到点撤力后转子可能溜回上一个齿槽(实测 16.7°), 这时必须立刻重新介入,
+   不能死等 settle(松手静默)和积分开闸超时 —— 那要 0.77s 才爬得回来。
+   取 13°(= POS_HOLD_OUT_DEG) ⇒ 覆盖一个齿距(15.47°)的 84%, 正常在目标
+   附近的小幅摆动不会触发。 */
+#define POS_REENGAGE_DEG     13.0f
 /* ★★ 2026-10-11ah 近目标"松手静默"(settle) ------------------------------------
    实测(10-11af 日志, Tgt=180)转子在 **161.0 ↔ 187.3** 之间以 ~5Hz、±13° 永续
    摆动, `Iqref` 在 ±1.30A 之间翻, 12 秒不停; 同一份日志里 Tgt=0 却完全安静
@@ -647,7 +685,9 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    让齿槽自己把转子接住 —— 不推、也不刹(这 250ms 里的速度估计没有意义)。
    触发条件刻意选成"上一条边沿间隔 >100ms": 那说明这是一次**从静止起步的
    离散小步**, 而不是 30ms 一条边沿的高速飞掠 ⇒ 高速进近时照旧由刹车接管。 */
-#define POS_SETTLE_TICKS      (250U * 20U)   /* 松手静默时长 */
+#define POS_SETTLE_TICKS      (150U * 20U)   /* 松手静默时长
+                                             ★ cal26: 250→150ms。到点回弹后这 250ms
+                                             里一直是撤力状态, 是 0.77s 恢复时间的一半。 */
 #define POS_SETTLE_SLOW_DT    (100U * 20U)   /* 上一条边沿间隔 > 它 ⇒ 视为"离散小步" */
 #define POS_SETTLE_ARM_DEG    10.0f          /* 只在 |err|< 它 时触发(近目标) */
 /* ★★ 2026-10-11ai 近目标“只允许不足以起步的电流”
@@ -881,7 +921,14 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
 #define POS_TM_TA_FRAC          (2.0f / 9.0f)   /* 加速占比(时间) */
 #define POS_TM_TC_FRAC          (3.0f / 9.0f)   /* 匀速占比 */
 #define POS_TM_TD_FRAC          (2.0f / 9.0f)   /* 减速占比 */
-#define POS_TM_VAPP_DEG_S       40.0f           /* 逼近段速度(机械°/s) */
+/* ★★★ cal30: 逼近段速度 40.0 → **28.0** °/s
+   依据(cal29 日志, 第 3 次 `8`): 到位前 113ms 里读数从 331.44 跳到 360.66
+   ⇒ **~257°/s**, 而齿槽能擒住的上限只有 **~195°/s** ⇒ 冲过齿槽被“弹簧”拉回
+   一整个齿格(360.66 → **343.34**, -17.3°), 然后环路拿 1.96A 顶了 ~500ms
+   才推回来 —— 就是用户感到的“到位后振动一下”。
+   28°/s 只在最后 2/9 时间里起作用(末段少走 2°), 巡航 vc 几乎不变
+   (D=360/T=0.81: vc 从 776 → 783), 所以对运动负载率/耗时无影响。 */
+#define POS_TM_VAPP_DEG_S       28.0f           /* 逼近段速度(机械°/s) */
 /* ★★ 2026-10-11am 轨迹改为“**物理模型前馈 + 小权限位置微调**”，完全不用测速
    ----------------------------------------------------------------------
    实测(10-11al 日志): 把轨迹的速度环增益提到 0.03 之后, **过程大幅抖动** ——
@@ -929,7 +976,27 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
      0.6~0.7A ⇒ **真的在减速**, 不再需要"硬切"; 到目标前 v→0 时前馈
      按比例缩到 0 ⇒ 末速自然归零。 */
 #define POS_TM_FRIC_STATIC_A    1.45f    /* 等效静摩擦(破黏)电流(A) */
-#define POS_TM_FRIC_SLIDE_A     0.70f    /* 等效滑动摩擦电流(A) */
+#define POS_TM_FRIC_SLIDE_A     0.20f    /* 等效滑动摩擦电流(A)
+                                             ★★★ 2026-10-18 (cal17) **0.70→0.20**, 由日志定标:
+                                             13:43 版日志里 `Iqref` 的最小值是 **0.09~0.25A**
+                                             (依次 0.09/0.11/0.16/0.17/0.19/0.20/0.24/0.25),
+                                             **从来没有负过** ⇒ 说明 0.70A 的前馈被 trim 的
+                                             −0.45A 抵消掉了, 环路**根本没有刹车能力**:
+                                             净力矩最低只能到 ≈0 ⇒ 转子只能靠摩擦自己减速。
+                                             后果链(实测 `8`=0.4→360/1.5s):
+                                               起步破黏滞后 → trim +0.66A ⇒ iq=1.37A
+                                               → 冲到 **704°/s**(规划 407, 1.7 倍)
+                                               → tv 变负, trim 拉到 −0.47 ⇒ iq=0.19A
+                                               → **净力≈0 ⇒ 只能滑行**
+                                               → 滑到齿槽 314.48° 时被擒住 **卡 145ms**
+                                               → 参考追上来再推 1.06A ⇒ 又跳一下
+                                               = 用户说的"停顿感"(周期 ~250ms)。
+                                             给 0.20A(实测维持 407°/s 的真实值)之后:
+                                             巡航 `trim≈0`, trim 的 ±2.0A **两侧都可用**
+                                             ⇒ iq 最小可到 **−0.9A** ⇒ 净 −1.1A
+                                             = 11000°/s², 从 704 拉回 407 只要 26ms。
+                                             ⚠ 不要再用 0.70: 那是"名义值", 实际全被
+                                              trim 吃掉, 等于把刹车权限锁死。 */
 #define POS_TM_FRIC_V0_DEG_S    25.0f    /* Stribeck 过渡速度尺度(机械°/s) */
 #define POS_TM_FF_VMIN          1.0f     /* |轨迹速度| 低于它 ⇒ 前馈按比例缩到 0 */
 #define POS_TM_FF_SIGN_DEG_S    3.0f     /* 前馈符号的软过渡尺度(机械°/s) */
@@ -956,6 +1023,25 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
 #define POS_TM_K_DEG_S2_PER_A   10000.0f  /* 实测 1A ≈ 10000°/s² */
 #define POS_TM_OBS_WO_RAD_S     30.0f     /* 速度观测器带宽(rad/s) ⇒ 滞后 ~33ms */
 #define POS_TM_OBS_VMAX_DEG_S   2000.0f   /* 观测速度限幅 */
+/* ★★★ cal28: 观测器模型输入的限幅(A)
+   ------------------------------------------------------------------
+   α-β 观测器的稳态偏置是可以精确算出来的:  vobs = v_true + (2K/wo)·u
+   代入 K=10000, wo=30 ⇒ **每 1A 模型输入就把观测速度抬高 667°/s**。
+   u = iq − iq_f = a_ff + trim + damp，而 **trim 在齿槽处能顶到 1.9A**
+   ⇒ 偏置可达 1267°/s！
+
+   实测(cal27 t=10869, `8` 加速段中段):
+     真速 304°/s、规划 784°/s，但 vob=1019 ⇒ 偏置 ~715°/s
+     ⇒ damp = 0.002×(784-1019) = **-0.47A 在刹车**
+     而此刻正确的动作是 **+0.96A 往前推**（转子已经掉速了）
+     ⇒ 阻尼在帮着齿槽拖住转子 ⇒ verr 涨到 63.5° ⇒ trim 顶到 1.9A
+     ⇒ 一旦破黏就以 1190°/s 冲出去(**规划的 1.5 倍**)。
+
+   限幅到 ±0.35A 后:
+     · 齿槽处偏置最多 667×0.35 = **233°/s** ⇒ vobs≈537, damp=**+0.49A**(变成往前推) ✔
+     · 正常巡航 iq_net ≈ trim+damp ≈ 0.2~0.5A，限幅基本不吃
+       ⇒ 保留原来的"用指令电流积分平滑测速"的好处，不会引入霍尔台阶纹波。 */
+#define POS_TM_OBS_IQNET_MAX_A  0.35f
 /* ★★ 2026-10-11ap 两个限幅 —— 修实测(`8`=360°/1s, 10-11ao 日志)"运行中间一段
    比较大的振动":
    ① **轨迹期间一律跳过"实测速度驱动"的旁路**(超速保险/脱困刹车/破黏脉冲/
@@ -969,8 +1055,18 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
       (2.5−1.45)=1.05A = 10500°/s² ⇒ 实测起步 30ms 就飞到 **~2000°/s**。
       限到 1.9A(比实测最深的破黏 1.6A 还高 0.3A) ⇒ 搵开瞬间净力矩
       ≤0.45A ⇒ 起步平缓得多。刹车侧不受此限(仍到 2.5A)。 */
-#define POS_TM_IQ_DRIVE_MAX_A   1.90f     /* 轨迹期间驱动方向电流上限(A) */
-#define POS_TM_DAMP_MAX_A       0.50f     /* 阻尼项自己的限幅(A, 观测速度只~±100°/s 可信) */
+#define POS_TM_IQ_DRIVE_MAX_A   1.70f     /* 轨迹期间驱动方向电流上限(A)
+                                             ★ cal19: 1.90→1.70。实测破黏时电流
+                                             顶到 1.90A, 净力矩 (1.90-1.45)=0.45A
+                                             一个扇区就能积到 ~373°/s, 实测直接冲到
+                                             565~939°/s。1.70A 把"踢出扇区"的净
+                                             力矩压到 0.25A ⇒ 起步冲量小三成。 */
+#define POS_TM_DAMP_MAX_A       0.80f     /* 阻尼项限幅(A)
+                                             ★ cal18: 0.50→0.80。0.50A 只相当于
+                                             250°/s 的速度误差; 实测跟踪误差常年
+                                             300~660°/s ⇒ 阻尼**一直在饱和**, 等于
+                                             没有阻尼。0.80A ≈ 400°/s 的误差余量,
+                                             仍然远小于 trim 的 2.0A, 不会盖掉刹车。 */
 /* 轨迹状态量(2026-10-11am 模型前馈 / 2026-10-11ao 速度观测器):
    s_tm_iq=本拍电流; s_tm_vprev=上一拍轨迹速度(算加速度项);
    s_tm_vobs/s_tm_posobs=速度观测器状态(只用于阻尼) */
@@ -1004,6 +1100,16 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
 #define POS_TM_KV_A_PER_ERPM    0.030f   /* 轨迹期间速度环增益(A/eRPM) */
 #define POS_TM_DONE_DEG         3.0f     /* |err| 小于它 ⇒ 轨迹交由普通逻辑收尾 */
 #define POS_TM_TAIL_TICKS       (1500U * 20U)  /* 收尾段最长再扰 1.5s */
+/* ★ cal19 新增两个量 */
+#define POS_TM_START_DEG        12.0f    /* 起步破黏窗口: 离起点不足它就给静摩擦 */
+#define POS_TM_END_QUIET_TICKS  (120U * 20U) /* ★ cal30: 60→120ms 无霍尔边沿才结束
+                                             等效“已慢于 **~129°/s**”—— 这是关键:
+                                             60ms 只等效 <258°/s, 而实测到位余速
+                                             257°/s 恰好卡在它旁边(cal29 t=25863),
+                                             于是“quiet”恒为真、根本没起到“确认停住”
+                                             的作用 ⇒ 带 257°/s 冲进齿槽 ⇒ 回退 17.3°。
+                                             120ms 的边沿间隔 ⇔ 15.47/0.12 = 129°/s,
+                                             稳稳低于齿槽擒住极限 195°/s。 */
 /* ★ 2026-10-11ab 齿槽能“擒住”的速度上限(实测 ~130eRPM): 位置环拿它当
    "需不需要刹"的门槛 —— 低于它转子会被齿槽自己接住, 高于它一定冲过目标。 */
 #define POS_CAPTURE_ERPM      150.0f
@@ -1264,6 +1370,44 @@ static uint32_t s_pos_block_tick = 0U;   /* blocked_hard 置位的时刻 */
          vc=巡航(°/s); vapp=逼近速度(°/s)
    输出: 返回值=已走过的机械角度(magnitude); *v_out=当前速度(°/s)
    四段全解析式 ⇒ 不积分、不漂。斜坡内部是升余弦(S 形) ⇒ 加速度连续。 */
+/* ==========================================================================
+ * exp(-v/V0) 查表（建议③）
+ * --------------------------------------------------------------------------
+ * 轨迹运行时每拍要算 1 次 `expf(-vmag_fric / POS_TM_FRIC_V0_DEG_S)`。
+ * ARM 的 expf 约 100~200 周期；换成 64 点表 + 线性插值约 15 周期。
+ * 自变量是本机速度(°/s)，超过 250 时 e^(-250/25)=4.5e-5 ⇒ 乘上
+ * (STATIC-SLIDE)=1.25A 后只有 6e-5A，完全可以当 0，所以表只做到 250。
+ * ========================================================================== */
+#define TM_EXP_N      64
+#define TM_EXP_VMAX   250.0f
+#define TM_EXP_STEP   (TM_EXP_VMAX / (float)TM_EXP_N)
+#define TM_EXP_K      ((float)TM_EXP_N / TM_EXP_VMAX)
+
+static float s_tm_exp[TM_EXP_N + 1];
+
+static void TM_ExpInit(void)
+{
+    int32_t i;
+    for (i = 0; i <= TM_EXP_N; i++) {
+        s_tm_exp[i] = expf(-(float)i * TM_EXP_STEP / POS_TM_FRIC_V0_DEG_S);
+    }
+}
+
+/* 返回 exp(-v/V0)，v 取绝对值并鉗到 [0, VMAX] */
+static float TM_ExpNeg(float v)
+{
+    float x, f;
+    int32_t i;
+
+    if (!(v > 0.0f)) { return 1.0f; }   /* 兼顾 NaN */
+    if (v >= TM_EXP_VMAX) { return 0.0f; }
+    x = v * TM_EXP_K;
+    i = (int32_t)x;
+    if (i >= TM_EXP_N) { return 0.0f; }
+    f = x - (float)i;
+    return s_tm_exp[i] + f * (s_tm_exp[i + 1] - s_tm_exp[i]);
+}
+
 static float TM_Profile4(float t, float ta, float tc, float td, float tapp,
                          float vc, float vapp, float *v_out)
 {
@@ -1278,23 +1422,34 @@ static float TM_Profile4(float t, float ta, float tc, float td, float tapp,
     }
     if (t < ta) {                                    /* 加速(S 形): 0 → vc */
         float u = t / ta;
-        *v_out = vc * 0.5f * (1.0f - cosf(PI * u));
-        p = vc * ta * (u * 0.5f - sinf(PI * u) / (2.0f * PI));
+        float su, cu;                              /* ★ 查表代替 sinf/cosf */
+        FOC_SinCos(PI * u, &su, &cu);
+        *v_out = vc * 0.5f * (1.0f - cu);
+        p = vc * ta * (u * 0.5f - su / (2.0f * PI));
     } else if (t < ta + tc) {                        /* 匀速: vc */
         *v_out = vc;
         p = p1 + vc * (t - ta);
     } else if (t < ta + tc + td) {                   /* 减速(S 形): vc → vapp */
         float u  = (t - ta - tc) / td;
         float dv = vc - vapp;
-        *v_out = vapp + dv * 0.5f * (1.0f + cosf(PI * u));
+        float su, cu;
+        FOC_SinCos(PI * u, &su, &cu);
+        *v_out = vapp + dv * 0.5f * (1.0f + cu);
         p = p2 + td * (vapp * u + dv * (u * 0.5f
-                                       + sinf(PI * u) / (2.0f * PI)));
-    } else if (t < ta + tc + td + tapp) {            /* 逼近: 恒 vapp */
-        *v_out = vapp;
-        p = p3 + vapp * (t - ta - tc - td);
+                                       + su / (2.0f * PI)));
+    } else if (t < ta + tc + td + tapp) {            /* 逼近: vapp **线性减到 0**
+                                                       ★ cal19: 原来是"恒 vapp",
+                                                       时间一到速度从 vapp 直接
+                                                       硬切到 0 ⇒ 转子带着
+                                                       400+°/s 掠进齿槽再被弹回。
+                                                       改成线性收敛 ⇒ 轨迹自己
+                                                       在 t=T 时 v=0, 平滑落地。 */
+        float u = (t - ta - tc - td) / tapp;
+        *v_out = vapp * (1.0f - u);
+        p = p3 + vapp * tapp * (u - 0.5f * u * u);
     } else {                                         /* 结束: 停在目标上 */
         *v_out = 0.0f;
-        p = p3 + vapp * tapp;
+        p = p3 + vapp * tapp * 0.5f;
     }
     return p;
 }
@@ -1327,9 +1482,10 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         if (foc->probe_remain == 0U || fabsf(erpm_now) > 2500.0f) {
             /* 脉冲结束(或转速过高安全截断) */
             foc->current_loop.iq_ref = 0.0f;
-            LOGD("[PROBE] stop erpm=%.0f mech=%.1fdeg\n",
-                 erpm_now,
-                 AngleObserver_GetMechDeg(&foc->angle, foc->config.pole_pairs));
+            LOGD("[PROBE] stop erpm=%d mech=%dmdeg\n",
+                 (int)erpm_now,
+                 (int)(AngleObserver_GetMechDeg(&foc->angle, foc->config.pole_pairs)
+                       * 1000.0f));
             FOC_UpdateCurrent(foc);
             return;
         }
@@ -1459,8 +1615,8 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
        ② 滤波速度持续 200ms(4000 拍) 超过 1500eRPM —— 飞车。
        命中就 FAULT + 关 PWM, 按 'r' 清故障重来。 */
     if (fabsf(foc->position_loop.pos_err_deg) > 720.0f) {
-        LOGW("[POS] RUNAWAY: err=%.0fdeg > 720 -> FAULT\r\n",
-             foc->position_loop.pos_err_deg);
+        LOGW("[POS] RUNAWAY: err=%ddeg > 720 -> FAULT\r\n",
+             (int)foc->position_loop.pos_err_deg);
         FOC_Control_SetFault(foc, 0x0010);
         s_pos_fast_cnt = 0U;
         return;
@@ -1468,7 +1624,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
     if (fabsf(s_pos_erpm_filt) > 1500.0f) {
         s_pos_fast_cnt++;
         if (s_pos_fast_cnt > 4000U) {
-            LOGW("[POS] RUNAWAY: |vsp|=%.0feRPM -> FAULT\r\n", s_pos_erpm_filt);
+            LOGW("[POS] RUNAWAY: |vsp|=%deRPM -> FAULT\r\n", (int)s_pos_erpm_filt);
             FOC_Control_SetFault(foc, 0x0011);
             s_pos_fast_cnt = 0U;
             return;
@@ -1499,14 +1655,32 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         if (err_run > 16000U && since_edge > 16000U) {
             if (!s_pos_blocked_logged) {
                 s_pos_blocked_logged = 1;
-                LOGW("[POS] BLOCKED? err=%.1fdeg, no hall edge for %lums (Iqref=%.2fA)\n",
-                     err_now, (unsigned long)(since_edge / 20U),
-                     foc->current_loop.iq_ref);
+                LOGW("[POS] BLOCKED? err=%dmdeg, no hall edge for %lums (Iqref=%dmA)\n",
+                     (int)(err_now * 1000.0f), (unsigned long)(since_edge / 20U),
+                     (int)(foc->current_loop.iq_ref * 1000.0f));
             }
         } else {
             s_pos_blocked_logged = 0U;
         }
     }
+
+    /* ★★★ cal25 位置律分频门（见 POS_LAW_DIV 的说明）
+       到这里为止，下面这些**已经按 20kHz 跑完了**（不能降）:
+         FOC_UpdateAngle / 霍尔边沿计数 / 10ms 测速窗 / s_pos_erpm_filt /
+         100ms 扇区窗 / 跑飞保护 / 堵转看门狗
+       从这里开始才是"外层位置律"（带宽 3Hz）。分频后跳过的拍只跑电流环，
+       foc->current_loop.iq_ref / id_ref 沿用上一拍的值。 */
+#if (POS_LAW_DIV > 1U)
+    {
+        static uint8_t s_law_div = 0U;
+        if (++s_law_div < (uint8_t)POS_LAW_DIV) {
+            FOC_UpdateCurrent(foc);      /* 本拍: 只更新角度 + 电流环(20kHz) */
+            return;
+        }
+        s_law_div = 0U;
+        dt_s *= (float)POS_LAW_DIV;      /* 外层律的真实步长 = N 拍 */
+    }
+#endif
 
     /* ---- 位置环律 v4 (2026-10-01): 到位完全撤力矩; 运动中 P + 限幅阻尼 + 门控积分 ----
        v1(纯 PD kp=0.025) 出不了力; v2(+积分 kp=0.06) 到位后在目标周围 ±1 个霍尔
@@ -1587,12 +1761,25 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
             } else {
                 s_tm_phase = 8U;                            /* 收尾(已到点) */
             }
+            /* ★★★ cal19: 结束前必须"转子真的停住了"。
+               原来 `t>=Tm` 就直接结束 ⇒ 下一拍跳进"到位/静默撤力"分支把力矩
+               清零, 而转子当时还有 ~400°/s: 实测 t=27432 Pos=360.00 →
+               t=27457 Pos=341.01(**-19°, 折算 -760°/s**), 然后停在 340.69 达
+               230ms, 再被推回 360 —— 用户看到的就是"到了目标又弹一下"。
+               现在要求"距上次霍尔边沿 > 120ms"(= 已经慢于 ~129°/s) 才结束;
+               等待期间轨迹参考停在目标上(v_eff=0), 由 trim+damp 把它剥住。
+               安全帽: 超过 Tm+0.6s 无论如何结束。 */
             if (t >= Tm || fabsf(err) < POS_TM_DONE_DEG) {
-                /* 时间到了 或 已经贴住目标(≈到位死区) ⇒ 交回普通近目标逻辑。
-                   ★ 2026-10-11am: 不再做“收尾段” —— 模型前馈把轨迹跑完后残差
-                   只有几度(常量偏置级别), 直接用已有的死区/齿槽/爬行收尾更简单。 */
-                s_tm_active = 0U;
-                s_tm_phase  = 0U;
+                /* ★ cal22: 必须"**既到位又停住**"才结束。
+                   cal19 只要 quiet 就结束 ⇒ 转子在 344°(差 17°) 处被齿槽顶住、
+                   60ms 没边沿就被判成"安静" ⇒ 轨迹提前收工 ⇒ 又掉回老爬行律。 */
+                uint8_t quiet = ((foc->tick - foc->hall.edge_tick) >
+                                 POS_TM_END_QUIET_TICKS) ? 1U : 0U;
+                uint8_t done  = (quiet && (fabsf(err) < POS_TM_DONE_DEG)) ? 1U : 0U;
+                if ((done != 0U) || (t > (Tm + 0.60f))) {
+                    s_tm_active = 0U;
+                    s_tm_phase  = 0U;
+                }
             }
         }
 
@@ -1694,6 +1881,22 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
             }
         }
 
+        /* ★★★ cal26: 回弹后**立刻**重新介入。
+           实测 `8` 到点撤力 → 溜回一个齿槽(16.7°) → 要 0.77s 才爬回来:
+           其中 ~250ms 是 s_pos_settling 的“松手静默”, 另外一部分是积分开闸
+           的 300ms。现在: 误差一旦超过一个齿槽(POS_REENGAGE_DEG=13°,
+           与 POS_HOLD_OUT_DEG 同量级), 说明转子已经真的溜走了 ⇒ 静默/冻结
+           这两种“判停”标志立刻作废, 直接走正常律。
+           ⚠ 只清 settling/frozen, **不清 hold** —— hold 自己有自己的施密
+           特带(7.5°进 / 13°出), 清掉反而会在目标附近蹭。 */
+        if (!s_tm_active && (fabsf(err) > POS_REENGAGE_DEG)) {
+            s_pos_settling    = 0U;
+            s_pos_settle_tick = 0U;
+            s_pos_frozen      = 0U;
+            s_pos_freeze_t0   = 0U;
+            s_pos_freeze_tick = 0U;
+        }
+
         /* ★★ 2026-10-11ap: 轨迹激活期间这几条全部让位 —— 它们靠读数/测速
            判"停没停", 而本机这两样在运动中都不可信; 实测 `8` 中段就是被
            它们抢走控制权后在 ±2.5A 打摆。 */
@@ -1783,12 +1986,71 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         float vmag = fabsf(v_eff);
                         float iq_f = 0.0f;
                         float trim, damp;
+                        /* ★★★ cal18 (2026-10-18) —— Stribeck 的自变量改成
+                           **转子实际速度**, 不再用"规划速度。
+                           ---- 旧写法的致命点(由日志定量) ----
+                           `POS_TM_FRIC_V0_DEG_S` 只有 25°/s, 而规划速度在
+                           S 曲线加速段 **100ms 就涨到 84°/s** ⇒ 前馈从
+                           1.45A 落到 0.24A; 但此刻转子还**一动没动**
+                           (实测 `8`: 前 264ms 只走了 15°, 滞后 25°) ⇒
+                           **破黏那 1.2A 全落在 trim 身上** ⇒ trim 堆到
+                           +0.44~+1.48A ⇒ 一破黏就以 **730°/s** 冲出去(规划 407)
+                           ⇒ 之后全靠 trim 反过来刹车 ⇒ 刹车增益与驱动增益
+                           不对称(齿槽吃驱动、不吃刹车) ⇒ **1~3Hz 极限环**
+                           = 用户看到的"振动"。
+                           ---- 现在的做法 ----
+                           vmag_fric = min(|规划速度|, |实测速度|):
+                             · 转子不动(vsp≈0) ⇒ 一直给 1.45A 破黏;
+                             · 转子起来了 ⇒ 实测上来 ⇒ 前馈自然降到 0.20A;
+                             · **取 min 是关键**: v_eff 是上限 ⇒ 测速尖刺只能让
+                               前馈**变大**(= 多给一点力), 永远不会因为尖刺
+                               把前馈打到 0 —— 保留了原设计"不拿测速
+                               做增益"的安全性。
+                           副作用: 卡在齿槽里时 vsp≈0 ⇒ 前馈恒为 1.45A,
+                           恰好是抬起根据地的力 ⇒ 顺便治了"停顿感"。 */
+                        /* ★★★ cal19 (2026-10-18) —— **回退 cal18 的"跟随实测速度"写法**。
+                           cal18 用 `min(|v_eff|, 1.5路|vsp|)`, 本意是"转子不动就
+                           一直给 1.45A 破黏"。问题: `vsp`/`ob` 会在运动中间**整段
+                           塌到 0**(实测 t=27015 ob=0 / 27045 vsp=7 / 27281 ob=0,
+                           每次持续 30~100ms) ⇒ 摩擦前馈退化成 **0.20 ↔ 1.45A 的
+                           方波** ⇒ 慢→ff=1.45→猛冲(实测 565 / 686 / 939 °/s)
+                           →快→ff=0.20→掠速→慢 … 这就是"不平滑"的直接原因。
+                           现在改成**一次性的起步破黏**: 只在
+                             ① 还在加速段前 1.5·ta 之内, 且
+                             ② 还没离开起点一个扇区(|pos-deg0| < 12°)
+                           时把摩擦前馈钉在静摩擦 1.45A; 一转起来立刻回到
+                           f(规划速度)。于是"踹一脚"只发生在起步, 运动中间
+                           前馈是规划速度的平滑函数, 不会再有方波。 */
+                        /* ★★★ cal22 (2026-10-18) —— 前馈的"速度来源"分三种场合:
+                           ① 正常巡航/加减速: 直接用规划速度 v_eff;
+                           ② 起步破黏 (t < 1.5·ta 且还没离开起点一个扇区);
+                           ③ **收尾掉队** (t > Tm, 参考已停在目标上, v_eff=0, 但还差 >1°)。
+                             旧代码在 ③ 时: v_eff=0 ⇒ 整个前馈块被 `if (vmag>0.01)` 门控
+                             跳过 ⇒ iq_f=0 ⇒ 只剩 trim 的 0.030A/° ⇒ 差 17° 才 0.51A
+                             **推不动齿槽** ⇒ 卡在原地几百 ms。实测:
+                               t=179996 Pos=344.12 err=15.88 tm=9
+                               t=180114 Pos=342.57 err=17.43 tm=0 ←轨迹提前结束
+                               t=180851 Pos=360.00           ←0.7s 后才靠老爬行律挪进来
+                             这一段就是用户感知的"到点前一顿"。
+                             现在 ②③ 都强制用静摩擦 1.45A, ③ 用位置误差的方向。 */
+                        float   v_ff = v_eff;
+                        uint8_t hw   = 0U;
+                        if ((t < (ta * 1.5f)) &&
+                            (fabsf(pos_now_deg - s_tm_deg0) < POS_TM_START_DEG)) {
+                            hw = 1U;                              /* ② 起步破黏 */
+                        } else if ((t > Tm) && (fabsf(verr) > 1.0f)) {
+                            hw   = 2U;                            /* ③ 收尾掉队 */
+                            v_ff = (verr >= 0.0f) ? 50.0f : -50.0f;
+                        }
+                        vmag = fabsf(v_ff);
+                        /* hw ≠ 0 ⇒ expf(0)=1 ⇒ fric = POS_TM_FRIC_STATIC_A (1.45A) */
+                        float vmag_fric = (hw != 0U) ? 0.0f : vmag;
                         /* ① 摩擦前馈: 速度相关(Stribeck) + 符号软过渡 */
                         if (vmag > 0.01f) {
                             float fric = POS_TM_FRIC_SLIDE_A
                                        + (POS_TM_FRIC_STATIC_A - POS_TM_FRIC_SLIDE_A)
-                                         * expf(-vmag / POS_TM_FRIC_V0_DEG_S);
-                            float s = v_eff / POS_TM_FF_SIGN_DEG_S;
+                                         * TM_ExpNeg(vmag_fric);
+                            float s = v_ff / POS_TM_FF_SIGN_DEG_S;
                             if (s >  1.0f) s =  1.0f;
                             if (s < -1.0f) s = -1.0f;
                             if (vmag < POS_TM_FF_VMIN) s *= (vmag / POS_TM_FF_VMIN);
@@ -1815,12 +2077,30 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         s_tm_dbg_verr = verr;
                         s_tm_dbg_ff   = iq_f;
                         s_tm_dbg_trim = trim + damp;
-                        /* ⑤ 速度观测器更新(用刚算出的指令电流作为模型输入) */
+                        /* ⑤ 速度观测器更新(用刚算出的指令电流作为模型输入)
+                           ★★★ cal18: 模型输入必须是"**真正产生加速度的那部分**
+                           电流", 也就是 `s_tm_iq - iq_f`。原来减的是
+                           `sgn × POS_TM_FRIC_SLIDE_A`(=0.20A 的**滑动**摩擦),
+                           而实际减掉的是 `iq_f`(破黏期 1.45A) ⇒ 观测器以为
+                           "还有 1.25A 在加速" ⇒ 速度被系统性抬高。
+                           α-β 观测器的稳态偏置可以**精确地**算出来:
+                             vobs_dot = K·u + wo²·oerr = 0  ⇒ oerr = -K·u/wo²
+                             vobs = v_true - 2·wo·oerr = v_true + (2K/wo)·u
+                           代入 K=10000, wo=30 ⇒ **vobs = v_true + 667·u** (°/s/A)。
+                           日志验证(t=11660): iq=0.92, 真速 192 ⇒
+                             预测 vobs = 192 + 667×(0.92-0.20) = 672, 实测 vob=676 ✔
+                           于是阻尼项 0.002×(407-676) = -0.54A 恒被 -0.50A 限幅打死
+                           ⇒ 环路退化成"纯 P 位置环"(ωn=17rad/s, ζ≈0) ⇒ 极限环。
+                           现在 u = iq - iq_f, 稳态就是 a_ff + trim + damp ≈ 0
+                           ⇒ 偏置消失, 阻尼真正生效。 */
                         {
                             float wo    = POS_TM_OBS_WO_RAD_S;
-                            float iq_net = s_tm_iq
-                                         - (float)s_tm_sgn * POS_TM_FRIC_SLIDE_A;
+                            /* ★ cal28: 模型输入限幅，防止 trim 把观测速度吹大
+                               (详见 POS_TM_OBS_IQNET_MAX_A 的注释) */
+                            float iq_net = s_tm_iq - iq_f;
                             float oerr;
+                            if (iq_net >  POS_TM_OBS_IQNET_MAX_A) iq_net =  POS_TM_OBS_IQNET_MAX_A;
+                            if (iq_net < -POS_TM_OBS_IQNET_MAX_A) iq_net = -POS_TM_OBS_IQNET_MAX_A;
                             s_tm_vobs   += POS_TM_K_DEG_S2_PER_A * iq_net * dt_s;
                             s_tm_posobs += s_tm_vobs * dt_s;
                             oerr = pos_now_deg - s_tm_posobs;
@@ -1970,7 +2250,8 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         (foc->tick - s_pos_soft_end_tick) > POS_SOFT_GIVE_RETRY_TICKS) {
                         s_pos_hop_give = 0U;
                         s_pos_hop_cnt  = 0U;
-                        LOGD("[POS] CREEP retry after give-up (err=%.1fdeg)\r\n", err);
+                        LOGD("[POS] CREEP retry after give-up (err=%dmdeg)\r\n",
+                             (int)(err * 1000.0f));
                     }
                     if (s_pos_soft_on) {
                         float travel = (pos_now_deg - s_pos_soft_start_deg)
@@ -2003,9 +2284,9 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                                 if (s_pos_hop_cnt > POS_HOP_MAX &&
                                     !s_pos_hop_give) {
                                     s_pos_hop_give = 1U;
-                                    LOGW("[POS] CREEP give up: %u x push at err=%.1fdeg with NO hall edge (even %.2fA) -> quiet %ums, then retry.\r\n",
-                                         (unsigned)POS_HOP_MAX, err,
-                                         POS_SOFT_IQ_MAX_A,
+                                    LOGW("[POS] CREEP give up: %u x push at err=%dmdeg with NO hall edge (even %dmA) -> quiet %ums, then retry.\r\n",
+                                         (unsigned)POS_HOP_MAX, (int)(err * 1000.0f),
+                                         (int)(POS_SOFT_IQ_MAX_A * 1000.0f),
                                          (unsigned)(POS_SOFT_GIVE_RETRY_TICKS / 20U));
                                 }
                             }
@@ -2022,9 +2303,10 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         s_pos_soft_start_deg = pos_now_deg;
                         s_pos_soft_sect0     = foc->angle.sect_run;
                         s_pos_soft_etick0    = foc->hall.edge_tick;
-                        LOGD("[POS] CREEP(%u): %.1fdeg off, push %.2fA\r\n",
-                             (unsigned)s_pos_hop_cnt, err,
-                             POS_SOFT_IQ_A + POS_SOFT_STEP_A * (float)s_pos_hop_cnt);
+                        LOGD("[POS] CREEP(%u): %dmdeg off, push %dmA\r\n",
+                             (unsigned)s_pos_hop_cnt, (int)(err * 1000.0f),
+                             (int)((POS_SOFT_IQ_A + POS_SOFT_STEP_A
+                                    * (float)s_pos_hop_cnt) * 1000.0f));
                     }
                     if (s_pos_soft_on) {
                         /* 电流按"连续失败次数"分档上爬: 1.30 / 1.40 / ... / 上限 2.00A
@@ -2125,8 +2407,9 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         if (s_pos_blocked_hard == 0U) {
                             s_pos_blocked_hard = 1U;
                             s_pos_block_tick   = foc->tick;
-                            LOGW("[POS] BLOCKED: %u kicks x %.1fA produced NO hall edge (err=%.1fdeg, since_edge=%lums).\r\n",
-                                 (unsigned)s_pos_kick_fail, POS_KICK_A, err,
+                            LOGW("[POS] BLOCKED: %u kicks x %dmA produced NO hall edge (err=%dmdeg, since_edge=%lums).\r\n",
+                                 (unsigned)s_pos_kick_fail, (int)(POS_KICK_A * 1000.0f),
+                                 (int)(err * 1000.0f),
                                  (unsigned long)(since_edge / 20U));
                             LOGW("[POS] -> torque is not reaching the rotor (mechanism jammed/loaded, or commutation angle wrong).\r\n");
                             LOGW("[POS] -> hold %us then retry automatically (or press a digit key / 'r').\r\n",
@@ -2144,10 +2427,10 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         CurrentLoop_SetQInteg(&foc->current_loop,
                                               ((err > 0.0f) ? POS_KICK_A : -POS_KICK_A)
                                               * (float)foc->torque_dir * POS_FF_DUTY_PER_A);
-                        LOGW("[POS] STICTION kick #%u: %.1fA for %ums (err=%.1fdeg, stalled %lums)\r\n",
-                             (unsigned)s_pos_kick_cnt, POS_KICK_A,
+                        LOGW("[POS] STICTION kick #%u: %dmA for %ums (err=%dmdeg, stalled %lums)\r\n",
+                             (unsigned)s_pos_kick_cnt, (int)(POS_KICK_A * 1000.0f),
                              (unsigned)(POS_KICK_TICKS / 20U),
-                             err, (unsigned long)(since_edge / 20U));
+                             (int)(err * 1000.0f), (unsigned long)(since_edge / 20U));
                     }
                 }
 
@@ -2902,7 +3185,9 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
     Tmin_v = 1.8f * D / POS_TM_VMAX_MECH_DEG_S;
     T = (Tmin_a > Tmin_v) ? Tmin_a : Tmin_v;
     if (dur_s < T) {
-        LOGW("[TM] %.2fs too short for %.1fdeg -> use %.2fs (accel/capture limit)\r\n",
+        /* ★ cal28: 降为 LOGD —— d<合理值 时每按一次都会提示, 算正常行为,
+           不该每次刷一条 WARN。真要查就开 verbose。 */
+        LOGD("[TM] %.2fs too short for %.1fdeg -> use %.2fs (accel/capture limit)\r\n",
              dur_s, D, T);
     } else {
         T = dur_s;
@@ -2924,7 +3209,10 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
         float td = T * POS_TM_TD_FRAC;
         float tapp = T - ta - tc - td;
         float den  = ta * 0.5f + tc + td * 0.5f;
-        float dmin_k = ta * 0.5f + tc + td + tapp;      /* = T - ta/2 */
+        /* ★ cal19 同理: 逼近段改为 vapp 线性减到 0, 其平均速度是 vapp/2 ⇒
+           总行程里的 vapp 系数从 (td/2 + tapp) 变成 (td/2 + tapp/2)。
+           dmin_k(= vc=vapp 时的最小行程 / vapp) = ta/2 + tc + td + tapp/2。 */
+        float dmin_k = ta * 0.5f + tc + td + tapp * 0.5f;
         float vapp = POS_TM_VAPP_DEG_S;
         float vc;
 
@@ -2932,7 +3220,7 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
             vapp = D / dmin_k;                          /* 短行程: 等比例降逼近速度 */
             if (vapp < 1.0f) vapp = 1.0f;
         }
-        vc = (D - vapp * (td * 0.5f + tapp)) / den;
+        vc = (D - vapp * (td * 0.5f + tapp * 0.5f)) / den;
         if (vc < vapp) vc = vapp;
         s_tm_vapp = vapp;
         s_tm_vc   = vc;
@@ -3075,9 +3363,10 @@ void FOC_Control_SetFault(FOC_Control_t *foc, uint32_t code)
        0x0001=过流, 0x0002=启动超时(霍尔没同步).
        母线电压是关键: 若 vb 远低于 24V, 说明电源被限流/供电塌陷, 此时
        "0.45 占空比"根本没有 11V 输出, 电流环必然顶到限幅也拉不到目标值. */
-    LOGD("[FAULT] code=0x%04X iu=%.2f iv=%.2f iw=%.2f state=%d vb=%.1fV tick=%u\n",
-         code, foc->current.u, foc->current.v, foc->current.w,
-         (int)foc->state, foc->current.vbus, foc->tick);
+    LOGD("[FAULT] code=0x%04X iu=%dmA iv=%dmA iw=%dmA state=%d vb=%dmV tick=%u\n",
+         code, (int)(foc->current.u * 1000.0f), (int)(foc->current.v * 1000.0f),
+         (int)(foc->current.w * 1000.0f),
+         (int)foc->state, (int)(foc->current.vbus * 1000.0f), foc->tick);
 }
 
 FOC_State_t FOC_Control_GetState(const FOC_Control_t *foc)

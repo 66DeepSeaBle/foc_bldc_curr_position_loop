@@ -65,4 +65,43 @@ uint8_t  BSP_UART_TxAsync(const uint8_t *buf, uint16_t len);    /* 1 = 已交给
  * ========================================================================== */
 uint8_t  BSP_WaveTimer_Start(void);   /* 启动波形节拍定时器(TIM6, 1kHz */
 
+/* ==========================================================================
+ * 中断负载率测量(DWT 周期计数器 = CPU 周期)
+ * --------------------------------------------------------------------------
+ * 用法:
+ *   1) BSP_Init() 里已自动调 BSP_Prof_Init();
+ *   2) 在每个要测的中断里把"被测代码"夹在两次 DWT->CYCCNT 读数之间,
+ *      把差值交给 BSP_Prof_RecordIsr() / BSP_Prof_RecordWave();
+ *   3) 主循环里定期 BSP_Prof_Take() 取一次(读并清零, 开新窗口)。
+ * 所有周期数都是 HCLK 周期(170MHz ⇒ 1us = 170 周期)。
+ * ========================================================================== */
+typedef struct {
+    uint32_t isr_cycles;   /* 本窗口 20kHz 控制环中断里的总周期数 */
+    uint32_t isr_max;      /* 单次最长周期数 */
+    uint32_t isr_count;    /* 本窗口进入次数 */
+    uint32_t wav_cycles;   /* 本窗口 1kHz VOFA 组帧中断的总周期数 */
+    uint32_t wav_max;
+    uint32_t wav_count;
+    uint32_t win_cycles;   /* 本窗口实际长度(周期数), 用来算百分比 */
+} BSP_Prof_t;
+
+void     BSP_Prof_Init(void);
+void     BSP_Prof_RecordIsr(uint32_t cyc);    /* 在控制中断里调用 */
+void     BSP_Prof_RecordWave(uint32_t cyc);   /* 在 TIM6 中断里调用 */
+void     BSP_Prof_Take(BSP_Prof_t *out);      /* 主循环调用: 读并清零, 开新窗口 */
+
+/* ==========================================================================
+ * 延迟日志队列(配合 log.h 的 LOG_Printf)
+ * --------------------------------------------------------------------------
+ * 中断里打的日志先进这个队列, 由主循环 BSP_Log_DeferFlush() 写出。
+ * 原因: printf→RTT 一行 20~120us, 放在 20kHz 控制中断里会直接掉拍
+ *       (实测 max=116us, 周期只有 50us)。
+ * ========================================================================== */
+void     BSP_Log_DeferFlush(void);   /* 主循环里每圈调一次 */
+
+/* ★ cal29: RTT 上行缓冲“丢整行”计数(累计, 只增)。
+   0 = RTT 缓冲从不丢数据 ⇒ 无需再加 BUFFER_SIZE_UP。
+   非 0 = 主机侧读得太慢(或 RTT Viewer 暂停/断连), 再加容量才有意义。 */
+uint32_t BSP_Log_GetRttDrop(void);
+
 #endif /* __BSP_H__ */

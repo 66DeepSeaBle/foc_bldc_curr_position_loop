@@ -19,6 +19,23 @@
 
 #include <stdio.h>
 
+/* ==========================================================================
+ * 统一日志出口（★ cal25）
+ * --------------------------------------------------------------------------
+ * 问题: `printf` → `fputc` → `SEGGER_RTT_PutChar` 逐字符写, 一行要 20~120us。
+ * 而这些日志里有 20 多处是从 **20kHz 控制中断** 里打的（[POS] CREEP /
+ * BLOCKED / STICTION / [ALIGN] / [STARTUP] / [OL] ...）
+ * ⇒ 实测 [PROF] max=116us, 而控制周期只有 50us ⇒ **那几拍已经掉拍**。
+ *
+ * 对策: 所有日志统一走 LOG_Printf()。它自己看 SCB->ICSR 的 VECTACTIVE 位：
+ *   · 主循环上下文 ⇒ 直接写 RTT(保持日志顺序)
+ *   · 中断上下文   ⇒ 只 vsnprintf 到环形队列, 由主循环的 BSP_Log_DeferFlush()
+ *                      写出。中断里开销从 20~120us 降到 2~6us。
+ *
+ * ✅ 调用点**不需要改** —— LOGD/LOGW 宏内部已经指向 LOG_Printf。
+ * ========================================================================== */
+int LOG_Printf(const char *fmt, ...);
+
 #define LOG_LEVEL_INFO   0
 #define LOG_LEVEL_DEBUG  1
 #define LOG_LEVEL_WARN   2
@@ -30,25 +47,25 @@
 #endif
 
 #if (LOG_MIN_LEVEL <= LOG_LEVEL_INFO)
-#define LOGI(...)   do { printf(__VA_ARGS__); } while (0)
+#define LOGI(...)   do { (void)LOG_Printf(__VA_ARGS__); } while (0)
 #else
 #define LOGI(...)   do { } while (0)
 #endif
 
 #if (LOG_MIN_LEVEL <= LOG_LEVEL_DEBUG)
-#define LOGD(...)   do { printf(__VA_ARGS__); } while (0)
+#define LOGD(...)   do { (void)LOG_Printf(__VA_ARGS__); } while (0)
 #else
 #define LOGD(...)   do { } while (0)
 #endif
 
 #if (LOG_MIN_LEVEL <= LOG_LEVEL_WARN)
-#define LOGW(...)   do { printf(__VA_ARGS__); } while (0)
+#define LOGW(...)   do { (void)LOG_Printf(__VA_ARGS__); } while (0)
 #else
 #define LOGW(...)   do { } while (0)
 #endif
 
 #if (LOG_MIN_LEVEL <= LOG_LEVEL_ERROR)
-#define LOGE(...)   do { printf(__VA_ARGS__); } while (0)
+#define LOGE(...)   do { (void)LOG_Printf(__VA_ARGS__); } while (0)
 #else
 #define LOGE(...)   do { } while (0)
 #endif

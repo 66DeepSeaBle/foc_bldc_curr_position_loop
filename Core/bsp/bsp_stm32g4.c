@@ -24,6 +24,7 @@
 #include "log.h"
 #include "SEGGER_RTT.h"
 #include <stdio.h>
+#include <stdarg.h>       /* ★ LOG_Printf 用 va_list/vsnprintf */
 
 /* 上游 CubeMX 生成的外设句柄(定义在 adc.c / tim.c / usart.c 里) */
 extern ADC_HandleTypeDef  hadc1;
@@ -78,6 +79,60 @@ void BSP_Init(void)
     MX_OPAMP3_Init();
 
     SEGGER_RTT_Init();             /* 调试输出(RTT, 不需要串口) */
+
+    BSP_Prof_Init();               /* DWT 周期计数器: 中断负载率测量 */
+}
+
+/* ==========================================================================
+ * 中断负载率测量(DWT->CYCCNT)
+ * --------------------------------------------------------------------------
+ * CYCCNT 是 32 位、每 HCLK 周期 +1。170MHz 下 25.3s 溢出一次 —— 本测量窗口
+ * 只有 1s, 而且全部用"无符号减法", 所以溢出不会出错。
+ * 累加变量都是 volatile, 中断里写、主循环里带中断屏蔽读并清零 ⇒ 无竞态。
+ * ========================================================================== */
+static volatile uint32_t s_pf_isr_sum = 0U, s_pf_isr_max = 0U, s_pf_isr_cnt = 0U;
+static volatile uint32_t s_pf_wav_sum = 0U, s_pf_wav_max = 0U, s_pf_wav_cnt = 0U;
+static volatile uint32_t s_pf_win_start = 0U;
+
+void BSP_Prof_Init(void)
+{
+    /* 必须先开 TRCENA, 否则 DWT 的寄存器不可访问/不计数 */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0U;
+    DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+
+    s_pf_isr_sum = 0U; s_pf_isr_max = 0U; s_pf_isr_cnt = 0U;
+    s_pf_wav_sum = 0U; s_pf_wav_max = 0U; s_pf_wav_cnt = 0U;
+    s_pf_win_start = DWT->CYCCNT;
+}
+
+void BSP_Prof_RecordIsr(uint32_t cyc)
+{
+    s_pf_isr_sum += cyc;
+    s_pf_isr_cnt++;
+    if (cyc > s_pf_isr_max) { s_pf_isr_max = cyc; }
+}
+
+void BSP_Prof_RecordWave(uint32_t cyc)
+{
+    s_pf_wav_sum += cyc;
+    s_pf_wav_cnt++;
+    if (cyc > s_pf_wav_max) { s_pf_wav_max = cyc; }
+}
+
+void BSP_Prof_Take(BSP_Prof_t *out)
+{
+    if (out == 0) { return; }
+    __disable_irq();
+    out->isr_cycles = s_pf_isr_sum;  s_pf_isr_sum = 0U;
+    out->isr_max    = s_pf_isr_max;  s_pf_isr_max = 0U;
+    out->isr_count  = s_pf_isr_cnt;  s_pf_isr_cnt = 0U;
+    out->wav_cycles = s_pf_wav_sum;  s_pf_wav_sum = 0U;
+    out->wav_max    = s_pf_wav_max;  s_pf_wav_max = 0U;
+    out->wav_count  = s_pf_wav_cnt;  s_pf_wav_cnt = 0U;
+    out->win_cycles = DWT->CYCCNT - s_pf_win_start;
+    s_pf_win_start  = DWT->CYCCNT;
+    __enable_irq();
 }
 
 /* ==========================================================================
@@ -228,10 +283,258 @@ uint8_t BSP_UART_TxAsync(const uint8_t *buf, uint16_t len)
 
 /* ==========================================================================
  * 调试输出: printf → RTT(缓冲 0)
- * ========================================================================== */int fputc(int ch, FILE *f)
+ * ========================================================================== */
+/* ==========================================================================
+ * 统一日志出口(★ cal25, 声明在 log.h)
+ * --------------------------------------------------------------------------
+ * 中断上下文里**不做 RTT 写**: printf→fputc→RTT_PutChar 是逐字符写, 一行要
+ * 20~120us, 而 20kHz 控制中断的周期只有 50us ⇒ 实测 max=116us, 直接掉拍。
+ * 现在中断里只 vsnprintf 到环形队列(2~6us), 由主循环 BSP_Log_DeferFlush()
+ * 一次性写出。主循环里的日志仍直接写, 保证顺序不乱。
+ * ⚠ 两个中断都可能是生产者(ADC=0 最高, TIM6=2), 用 busy 旗标互斥;
+ *   撞上就丢掉那一条(日志丢一条无所谓, 控制掉拍才是要命的)。
+ * ========================================================================== */
+#define LOGQ_N     8U
+#define LOGQ_LEN   128U
+
+static char              s_logq[LOGQ_N][LOGQ_LEN];
+static volatile uint8_t  s_logq_head = 0U;
+static volatile uint8_t  s_logq_tail = 0U;
+static volatile uint8_t  s_logq_busy = 0U;
+
+/* ★ cal29: RTT 丢行计数 + 行缓冲(定义提前, 因为 BSP_Log_DeferFlush 也要用) */
+#define RTT_LINE_MAX   384U
+
+static char              s_rtt_line[RTT_LINE_MAX];
+static unsigned          s_rtt_line_len = 0U;
+static volatile uint32_t s_rtt_drop     = 0U;   /* 被 SKIP 掉的**行**数 */
+
+/* ---- 极简整数格式化(★ cal27, 只给中断路径用) ----------------------------
+   cal26 发现: 把中断日志的 %.1f 换成 %dmA 之后 max 还是 108us —— 说明贵的不
+   是浮点, 而是 **ARM 的 vsnprintf 本身**(通用格式引擎要 50~100us)。
+   中断日志只用 %d/%u/%x/%X(带 0 填充宽度)、%c、%s, 所以这里自己写一个,
+   约 3~6us。**不支持 %f**: 中断日志里出现 %f 会打成 "?f" 提醒你改掉。
+   (%f 仍然可以在主循环日志里用 —— 那条路走 vprintf。) */
+
+static int LogFmt_UInt(char *d, int cap, uint32_t v, uint32_t base,
+                       uint8_t upper, int width, uint8_t zero)
+{
+    char tmp[12];
+    int  n = 0, i;
+    const char *dig = (upper != 0U) ? "0123456789ABCDEF" : "0123456789abcdef";
+
+    do {
+        tmp[n++] = dig[(unsigned)(v % base)];
+        v /= base;
+    } while ((v != 0U) && (n < 11));
+    while ((n < width) && (n < 11)) {
+        tmp[n++] = (zero != 0U) ? '0' : ' ';
+    }
+    if (n > (cap - 1)) { n = cap - 1; }
+    for (i = 0; i < n; i++) {
+        d[i] = tmp[n - 1 - i];
+    }
+    return n;
+}
+
+static int LogFmt(char *d, int cap, const char *fmt, va_list ap)
+{
+    int n = 0;
+
+    if ((d == 0) || (cap <= 1)) { return 0; }
+
+    while ((*fmt != '\0') && (n < (cap - 2))) {
+        if (*fmt != '%') {
+            d[n++] = *fmt++;
+            continue;
+        }
+        fmt++;
+        {
+            uint8_t zero  = 0U;
+            uint8_t lng   = 0U;
+            int     width = 0;
+            char    conv;
+            int     w;
+
+            if (*fmt == '0') { zero = 1U; fmt++; }
+            while ((*fmt >= '0') && (*fmt <= '9')) {
+                width = width * 10 + (int)(*fmt - '0');
+                fmt++;
+            }
+            if (*fmt == 'l') { lng = 1U; fmt++; }
+            conv = *fmt;
+            if (conv == '\0') { break; }
+            fmt++;
+
+            switch (conv) {
+            case '%':
+                d[n++] = '%';
+                break;
+            case 'c':
+                d[n++] = (char)va_arg(ap, int);
+                break;
+            case 's':
+                {
+                    const char *s = va_arg(ap, const char *);
+                    if (s == 0) { s = "(null)"; }
+                    while ((*s != '\0') && (n < (cap - 2))) { d[n++] = *s++; }
+                }
+                break;
+            case 'd':
+            case 'i':
+                {
+                    int32_t v = (lng != 0U) ? (int32_t)va_arg(ap, long)
+                                            : (int32_t)va_arg(ap, int);
+                    if (v < 0) {
+                        d[n++] = '-';
+                        v = -v;
+                    }
+                    w = LogFmt_UInt(&d[n], cap - n, (uint32_t)v, 10U, 0U, width, zero);
+                    n += w;
+                }
+                break;
+            case 'u':
+                {
+                    uint32_t v = (lng != 0U) ? (uint32_t)va_arg(ap, unsigned long)
+                                             : (uint32_t)va_arg(ap, unsigned int);
+                    w = LogFmt_UInt(&d[n], cap - n, v, 10U, 0U, width, zero);
+                    n += w;
+                }
+                break;
+            case 'x':
+            case 'X':
+                {
+                    uint32_t v = (lng != 0U) ? (uint32_t)va_arg(ap, unsigned long)
+                                             : (uint32_t)va_arg(ap, unsigned int);
+                    w = LogFmt_UInt(&d[n], cap - n, v, 16U,
+                                    (conv == 'X') ? 1U : 0U, width, zero);
+                    n += w;
+                }
+                break;
+            default:
+                /* 不支持(尤其 %f) ⇒ 打标记提醒, 同时**吞掉**那个参数不现实,
+                   所以这里只提示"中断日志里不能用这个转换"。 */
+                d[n++] = '?';
+                d[n++] = conv;
+                break;
+            }
+        }
+    }
+    d[n] = '\0';
+    return n;
+}
+
+int LOG_Printf(const char *fmt, ...)
+{
+    va_list ap;
+    int     n;
+    uint8_t in_isr = ((SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) != 0U) ? 1U : 0U;
+
+    if (fmt == 0) { return 0; }
+
+    if (in_isr == 0U) {
+        /* ★ cal27: 主循环走 vprintf → fputc → RTT, **不限行长、不截断**。
+           cal26 用 96 字节的 vsnprintf 缓冲, 结果 [MAIN]/[PROF]/[ADCR] 这些
+           200~300 字节的行全被砍掉一半, 日志里到处是半句拼接。 */
+        va_start(ap, fmt);
+        n = vprintf(fmt, ap);
+        va_end(ap);
+        return n;
+    }
+
+    /* ---- 中断上下文: 用极简整数格式化器入队 ---- */
+    if (s_logq_busy != 0U) { return 0; }
+    s_logq_busy = 1U;
+    {
+        uint8_t next = (uint8_t)((s_logq_head + 1U) & (LOGQ_N - 1U));
+        if (next == s_logq_tail) {          /* 队列满 ⇒ 丢 */
+            s_logq_busy = 0U;
+            return 0;
+        }
+        va_start(ap, fmt);
+        n = LogFmt(s_logq[s_logq_head], (int)LOGQ_LEN, fmt, ap);
+        va_end(ap);
+        if (n > 0) {
+            s_logq_head = next;
+        }
+    }
+    s_logq_busy = 0U;
+    return n;
+}
+
+void BSP_Log_DeferFlush(void)
+{
+    /* ★ cal26: 每次最多写 2 条。
+       原来一次把队列里(最多 8 条)全倒出去, 会把 RTT 上行缓冲瞬间打满 ⇒
+       NO_BLOCK_SKIP 丢尾巴, 日志里大量出现半句拼接。主循环 10ms 一圈,
+       2 条/圈 = 200 条/s, 足够且不会洪泛。 */
+    uint8_t n = 2U;
+
+    while ((n-- > 0U) && (s_logq_tail != s_logq_head)) {
+        /* ★ cal29: 整串写入是原子的(SKIP 模式要么全进要么全丢),
+           返回 0 就是这条被丢了 ⇒ 计数。 */
+        if (SEGGER_RTT_WriteString(0, s_logq[s_logq_tail]) == 0U) {
+            s_rtt_drop++;
+        }
+        s_logq_tail = (uint8_t)((s_logq_tail + 1U) & (LOGQ_N - 1U));
+    }
+}
+
+uint32_t BSP_Log_GetRttDrop(void)
+{
+    return s_rtt_drop;
+}
+
+/* ==========================================================================
+ * ★★★ cal29: fputc 改成“整行缓冲” —— 一行日志 = 一次 RTT 写入
+ * --------------------------------------------------------------------------
+ * 之前 fputc 是逐字节 SEGGER_RTT_PutChar, 而 AC5 的 vprintf 是**每个字符调
+ * 一次 fputc**。⇒ 一行 200 字节的 [PROF] 就是 200 次独立的“缓冲够不够”判定,
+ * 而 RTT 处在 NO_BLOCK_SKIP 模式(见 SEGGER_RTT.c 的 SKIP 分支):
+ *
+ *     Avail < NumBytes  ⇒  这次写入**整次丢弃**
+ *
+ * 于是缓冲将满时: 前 N 个字符已写进 ring, 中间一段被丢, J-Link 取走几个字节
+ * 后 Avail 又 >0 ⇒ 后面的字符**又能写进去** ⇒
+ * **一行中间出现一个“洞”**, 表现为:
+ *     [PROF] win=1000ms | FO ???乱码??? C@20k load=52.11%
+ * 这就是日志里那些“同长度前缀被换成乱码”的真正原因 ——
+ * **不是覆盖**(SEGGER_RTT_PutChar 里的 `WrOff != pRing->RdOff` 保证了它从
+ * 不覆盖未读数据), **是行内字节被丢**。
+ *
+ * 改后: 每个字符先攒进 s_rtt_line, 遇 '\n'(或超长)时**一次性**
+ * SEGGER_RTT_Write(0, s_rtt_line, len) ⇒ 每行只有 1 次 SKIP 判定:
+ *   · 要么整行完整进 buffer;
+ *   · 要么整行一条都不留(**只丢整行, 绝不出现半行/洞**)。
+ * 顺带把每行 200 次 BASEPRI 加/解锁砉成 1 次。
+ *
+ * ⚠ 不换掉 vprintf ⇒ %f / %lu 的链接行为完全不动, 零回归风险。
+ * ⚠ 中断里万一有人 printf: 直接逐字节直写, 不碰 s_rtt_line
+ *   (否则会踩花主循环攒到一半的那行)。
+ * ========================================================================== */
+
+int fputc(int ch, FILE *f)
 {
     (void)f;
-    SEGGER_RTT_PutChar(0, (char)ch);
+
+    /* 中断上下文: 不走行缓冲, 逐字节直写 */
+    if ((SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) != 0U) {
+        (void)SEGGER_RTT_PutChar(0, (char)ch);
+        return ch;
+    }
+
+    if ((s_rtt_line_len >= (RTT_LINE_MAX - 1U)) || (ch == '\n')) {
+        unsigned len;
+
+        s_rtt_line[s_rtt_line_len++] = (char)ch;
+        len = s_rtt_line_len;
+        if (SEGGER_RTT_Write(0, s_rtt_line, len) != len) {
+            s_rtt_drop++;                       /* 整行被 SKIP */
+        }
+        s_rtt_line_len = 0U;
+        return ch;
+    }
+    s_rtt_line[s_rtt_line_len++] = (char)ch;
     return ch;
 }
 
@@ -258,7 +561,12 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     } else if (hadc->Instance == CFG_ADC_CUR_HANDLE_B.Instance) {
         s_adc_iv_raw = (uint16_t)HAL_ADCEx_InjectedGetValue(&CFG_ADC_CUR_HANDLE_B,
                                                             ADC_INJECTED_RANK_1);
-        App_OnCurrentSample();          /* 三相都到齐了 ⇒ 跑控制环 */
+        /* ★ 中断负载率: 包住整个 20kHz 控制环(霍尔轮询 + FOC 位置/电流环) */
+        {
+            uint32_t t0 = DWT->CYCCNT;
+            App_OnCurrentSample();          /* 三相都到齐了 ⇒ 跑控制环 */
+            BSP_Prof_RecordIsr(DWT->CYCCNT - t0);
+        }
     }
 }
 
@@ -273,7 +581,12 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == CFG_WAVE_TIM_HANDLE.Instance) {
-        App_OnWaveTick();
+        /* ★ 中断负载率: 包住 FireWater 组帧 + 启动 DMA */
+        {
+            uint32_t t0 = DWT->CYCCNT;
+            App_OnWaveTick();
+            BSP_Prof_RecordWave(DWT->CYCCNT - t0);
+        }
     }
 }
 
