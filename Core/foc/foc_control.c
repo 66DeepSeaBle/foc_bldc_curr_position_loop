@@ -1113,6 +1113,16 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
 /* ★ 2026-10-11ab 齿槽能“擒住”的速度上限(实测 ~130eRPM): 位置环拿它当
    "需不需要刹"的门槛 —— 低于它转子会被齿槽自己接住, 高于它一定冲过目标。 */
 #define POS_CAPTURE_ERPM      150.0f
+/* ★★★ cal32: “中途卡住”的判据(轨迹位置误差, °)
+   ------------------------------------------------------------------
+   cal31 的 45° 实测(按键 1/3/5/7 全部中招): 转子走出一个齿槽(15.47°)就落地,
+   而 hw=1 的窗口要求 `|pos-deg0| < 12°` ⇒ **一落地就出窗** ⇒ 整段只剩滑动
+   摩擦 0.20A ⇒ 推不动 ⇒ 卡 190ms 等 trim 攒到 1.2A 才脱开 ⇒ 一下跳 29°:
+     t=9219 Pos=15.47 tv=-1.2 Iqref=0.14   ← 动不了
+     t=9411 Pos=15.48 tv=+29.0 Iqref=1.21  ← trim 攒够了
+     t=9513 Pos=44.48 tv=+0.5  Iqref=-0.27 ← 102ms 跳 29°(284°/s), 冲过齿槽
+   取 8.0°: 大于半个扇区(7.74° = 读数噪声上限)、小于一个齿槽(15.47°)。 */
+#define POS_TM_STALL_DEG        8.0f     /* 卡住判据: |verr| 超过它且转子未动 */
 /* 位置积分(现在只是静态误差微调, 摩擦已由前馈承担) */
 #define POS_INTEG_MAX_A      0.8f
 /* 总限幅与阻尼限幅必须同时抬到 2.5A(2026-10-09f): 实测冲过目标的机理是
@@ -2041,19 +2051,38 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         } else if ((t > Tm) && (fabsf(verr) > 1.0f)) {
                             hw   = 2U;                            /* ③ 收尾掉队 */
                             v_ff = (verr >= 0.0f) ? 50.0f : -50.0f;
+                        } else if ((s_pos_move == 0U) &&
+                                   (fabsf(verr) > POS_TM_STALL_DEG)) {
+                            /* ★★★ cal32: ③ **运动中卡在齿槽里** —— 转子确实没动
+                               (s_pos_move==0) 而轨迹参考已跑出去 8° 以上 ⇒
+                               把前馈钉在静摩擦 1.45A 立即破黏。 */
+                            hw   = 3U;
+                            v_ff = (verr >= 0.0f) ? 50.0f : -50.0f;
                         }
                         vmag = fabsf(v_ff);
                         /* hw ≠ 0 ⇒ expf(0)=1 ⇒ fric = POS_TM_FRIC_STATIC_A (1.45A) */
                         float vmag_fric = (hw != 0U) ? 0.0f : vmag;
-                        /* ① 摩擦前馈: 速度相关(Stribeck) + 符号软过渡 */
-                        if (vmag > 0.01f) {
+                        /* ① 摩擦前馈: 速度相关(Stribeck) + 符号软过渡
+                           ★ cal31: 把起步破黏从 `vmag > 0.01f` 的门里放出来。
+                           4 段轨迹的加速段是升余弦, 起步第一拍 v_eff = 0,
+                           于是 vmag = 0 < 0.01 ⇒ 整块 fric 被跳过 ⇒ 而 hw=1(起步
+                           破黏)的本意正是“起步瞬间就给 1.45A” ⇒ 破黏前馈从来
+                           没有真的给出来过。现在 `vmag > 0.01f || hw != 0U` ⇒ 起步
+                           窗口内即使规划速度为 0 也把 fric 算出来; 符号在 vmag≈0
+                           时取 s_tm_sgn(轨迹方向)。 */
+                        if ((vmag > 0.01f) || (hw != 0U)) {
                             float fric = POS_TM_FRIC_SLIDE_A
                                        + (POS_TM_FRIC_STATIC_A - POS_TM_FRIC_SLIDE_A)
                                          * TM_ExpNeg(vmag_fric);
-                            float s = v_ff / POS_TM_FF_SIGN_DEG_S;
-                            if (s >  1.0f) s =  1.0f;
-                            if (s < -1.0f) s = -1.0f;
-                            if (vmag < POS_TM_FF_VMIN) s *= (vmag / POS_TM_FF_VMIN);
+                            float s;
+                            if (vmag > 0.01f) {
+                                s = v_ff / POS_TM_FF_SIGN_DEG_S;
+                                if (s >  1.0f) s =  1.0f;
+                                if (s < -1.0f) s = -1.0f;
+                                if (vmag < POS_TM_FF_VMIN) s *= (vmag / POS_TM_FF_VMIN);
+                            } else {
+                                s = (float)s_tm_sgn;   /* 起步瞬间 v_eff=0 */
+                            }
                             iq_f = s * fric;
                         }
                         /* ② 位置微调(弹簧): 有权限驱动也**有权限刹车** */

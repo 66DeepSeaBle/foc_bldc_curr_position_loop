@@ -104,4 +104,13 @@ void     BSP_Log_DeferFlush(void);   /* 主循环里每圈调一次 */
    非 0 = 主机侧读得太慢(或 RTT Viewer 暂停/断连), 再加容量才有意义。 */
 uint32_t BSP_Log_GetRttDrop(void);
 
+/* ★ cal32: fputc 行缓冲的写侧诊断(累计/极值, 上电后一直有效)
+   avail_min = 写过的最小剩余空间(字节), force = 超长被强行切行的次数,
+   max_len   = 最长一行的字节数。
+   ⇒ 若 `force==0 && avail_min > 0 && drop==0`, 则写侧 100% 完整,
+      日志里剩余的乱码就一定发生在 J-Link/RTT Viewer 显示层。 */
+uint32_t BSP_Log_GetRttAvailMin(void);
+uint32_t BSP_Log_GetRttForce(void);
+uint32_t BSP_Log_GetRttMaxLen(void);
+
 #endif /* __BSP_H__ */

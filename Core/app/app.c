@@ -34,7 +34,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-18 cal30 quiet120 vapp28 tm085"
+#define FW_BUILD_TAG  "2026-10-18 cal32 stall-ff short-dur"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U
@@ -477,7 +477,10 @@ static void App_HandleKey(int ch)
            不是参数能解决的(要根治只能加齿槽补偿表或换磁编码器)。 */
         {
             float dur = fabsf(de) / 360.0f;
-            if (dur < 0.35f) dur = 0.35f;
+            /* ★ cal32: 下限 0.35 → 0.20s。45° 在 0.35s 档下 v_cruise 只有
+               250°/s(低于齿槽惯性穿越 384°/s) ⇒ 每个齿槽都要硬踢一脚。
+               0.20s 把 45° 的巡航抬到 ~292°/s, 配合 hw=3 破黏。 */
+            if (dur < 0.20f) dur = 0.20f;
             if (dur > FOC_POS_DEFAULT_TM_S) dur = FOC_POS_DEFAULT_TM_S;
             FOC_Control_SetTimedTarget(&g_foc, target, dur);
         }
@@ -836,7 +839,7 @@ static void App_ReportProf(uint32_t now)
 
         LOGD("[PROF] win=%lums | FOC@20k n=%lu load=%lu.%02lu%% tot=%lums avg=%lu.%02luus max=%lu.%02luus"
              " | VOFA@1k n=%lu load=%lu.%02lu%% tot=%lums avg=%lu.%02luus max=%lu.%02luus"
-             " | idle=%lu.%02lu%% | rttdrop=%lu\r\n",
+             " | idle=%lu.%02lu%% | rtt a=%lu f=%lu m=%lu drop=%lu\r\n",
              (unsigned long)(p.win_cycles / clk1000),
              (unsigned long)p.isr_count,
              (unsigned long)(isr_pm / 100U), (unsigned long)(isr_pm % 100U),
@@ -853,6 +856,9 @@ static void App_ReportProf(uint32_t now)
              (unsigned long)(App_CycToUsX100(p.wav_max) / 100U),
              (unsigned long)(App_CycToUsX100(p.wav_max) % 100U),
              (unsigned long)(idl_pm / 100U), (unsigned long)(idl_pm % 100U),
+             (unsigned long)BSP_Log_GetRttAvailMin(),
+             (unsigned long)BSP_Log_GetRttForce(),
+             (unsigned long)BSP_Log_GetRttMaxLen(),
              (unsigned long)rtt_drop);
     }
 }

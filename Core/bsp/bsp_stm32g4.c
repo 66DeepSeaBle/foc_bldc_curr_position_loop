@@ -308,6 +308,10 @@ static volatile uint8_t  s_logq_busy = 0U;
 static char              s_rtt_line[RTT_LINE_MAX];
 static unsigned          s_rtt_line_len = 0U;
 static volatile uint32_t s_rtt_drop     = 0U;   /* 被 SKIP 掉的**行**数 */
+/* ★ cal32: 写侧诊断(用于区分“固件丢数据”和“主机显示乱码”) */
+static volatile uint32_t s_rtt_avail_min = 0xFFFFFFFFU;
+static volatile uint32_t s_rtt_force     = 0U;
+static volatile uint32_t s_rtt_max_len   = 0U;
 
 /* ---- 极简整数格式化(★ cal27, 只给中断路径用) ----------------------------
    cal26 发现: 把中断日志的 %.1f 换成 %dmA 之后 max 还是 108us —— 说明贵的不
@@ -485,6 +489,21 @@ uint32_t BSP_Log_GetRttDrop(void)
     return s_rtt_drop;
 }
 
+uint32_t BSP_Log_GetRttAvailMin(void)
+{
+    return s_rtt_avail_min;
+}
+
+uint32_t BSP_Log_GetRttForce(void)
+{
+    return s_rtt_force;
+}
+
+uint32_t BSP_Log_GetRttMaxLen(void)
+{
+    return s_rtt_max_len;
+}
+
 /* ==========================================================================
  * ★★★ cal29: fputc 改成“整行缓冲” —— 一行日志 = 一次 RTT 写入
  * --------------------------------------------------------------------------
@@ -524,10 +543,17 @@ int fputc(int ch, FILE *f)
     }
 
     if ((s_rtt_line_len >= (RTT_LINE_MAX - 1U)) || (ch == '\n')) {
-        unsigned len;
+        unsigned len, av;
 
+        /* ★ cal32: 超长行被强行切行 ⇒ 记一次 force(日志里能看到是否发生) */
+        if ((s_rtt_line_len >= (RTT_LINE_MAX - 1U)) && (ch != '\n')) {
+            s_rtt_force++;
+        }
         s_rtt_line[s_rtt_line_len++] = (char)ch;
         len = s_rtt_line_len;
+        av  = SEGGER_RTT_GetAvailWriteSpace(0);
+        if (av < s_rtt_avail_min) { s_rtt_avail_min = av; }
+        if (len > s_rtt_max_len)  { s_rtt_max_len   = len; }
         if (SEGGER_RTT_Write(0, s_rtt_line, len) != len) {
             s_rtt_drop++;                       /* 整行被 SKIP */
         }
