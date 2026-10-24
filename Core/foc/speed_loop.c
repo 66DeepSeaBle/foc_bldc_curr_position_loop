@@ -61,7 +61,7 @@ float SpeedLoop_Update(SpeedLoop_t *loop,
         loop->settled_tick = 0;
     }
 
-    uint32_t settle_ticks = (uint32_t)((float)loop->settle_ms * 20000.0f / 1000.0f);
+    uint32_t settle_ticks = (uint32_t)((float)loop->settle_ms * (float)FOC_CTRL_HZ / 1000.0f);
     if (loop->settled_tick != 0 && (now_tick - loop->settled_tick) > settle_ticks) {
         loop->settled = 1;
         loop->iq_cap = loop->iq_max_normal;

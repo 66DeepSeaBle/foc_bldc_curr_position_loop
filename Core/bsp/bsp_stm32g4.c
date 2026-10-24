@@ -308,10 +308,6 @@ static volatile uint8_t  s_logq_busy = 0U;
 static char              s_rtt_line[RTT_LINE_MAX];
 static unsigned          s_rtt_line_len = 0U;
 static volatile uint32_t s_rtt_drop     = 0U;   /* 被 SKIP 掉的**行**数 */
-/* ★ cal32: 写侧诊断(用于区分“固件丢数据”和“主机显示乱码”) */
-static volatile uint32_t s_rtt_avail_min = 0xFFFFFFFFU;
-static volatile uint32_t s_rtt_force     = 0U;
-static volatile uint32_t s_rtt_max_len   = 0U;
 
 /* ---- 极简整数格式化(★ cal27, 只给中断路径用) ----------------------------
    cal26 发现: 把中断日志的 %.1f 换成 %dmA 之后 max 还是 108us —— 说明贵的不
@@ -489,21 +485,6 @@ uint32_t BSP_Log_GetRttDrop(void)
     return s_rtt_drop;
 }
 
-uint32_t BSP_Log_GetRttAvailMin(void)
-{
-    return s_rtt_avail_min;
-}
-
-uint32_t BSP_Log_GetRttForce(void)
-{
-    return s_rtt_force;
-}
-
-uint32_t BSP_Log_GetRttMaxLen(void)
-{
-    return s_rtt_max_len;
-}
-
 /* ==========================================================================
  * ★★★ cal29: fputc 改成“整行缓冲” —— 一行日志 = 一次 RTT 写入
  * --------------------------------------------------------------------------
@@ -543,17 +524,10 @@ int fputc(int ch, FILE *f)
     }
 
     if ((s_rtt_line_len >= (RTT_LINE_MAX - 1U)) || (ch == '\n')) {
-        unsigned len, av;
+        unsigned len;
 
-        /* ★ cal32: 超长行被强行切行 ⇒ 记一次 force(日志里能看到是否发生) */
-        if ((s_rtt_line_len >= (RTT_LINE_MAX - 1U)) && (ch != '\n')) {
-            s_rtt_force++;
-        }
         s_rtt_line[s_rtt_line_len++] = (char)ch;
         len = s_rtt_line_len;
-        av  = SEGGER_RTT_GetAvailWriteSpace(0);
-        if (av < s_rtt_avail_min) { s_rtt_avail_min = av; }
-        if (len > s_rtt_max_len)  { s_rtt_max_len   = len; }
         if (SEGGER_RTT_Write(0, s_rtt_line, len) != len) {
             s_rtt_drop++;                       /* 整行被 SKIP */
         }
@@ -659,4 +633,23 @@ void SystemClock_Config(void)
     if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
         Error_Handler();
     }
+
+    /* ★★★ 2026-10-24 性能关键(削峰第一步): 打开 Flash 预取 + I-Cache + D-Cache
+       ------------------------------------------------------------------
+       HAL_RCC_ClockConfig 只写了 4 个等待周期(LATENCY), **没有**打开缓存。
+       本工程 SystemClock_Config 是手写的(CubeMX 那种会带这三句), 于是一直以
+       "4WS + 无缓存 + 无预取" 在 170MHz 跑: 每条取指都要等好几拍,
+       常量表(sin/cos 512 点表, 2KB)每拍被读 4 次也全走 Flash。
+
+       这和实测对得上: [PROF] 里 IDLE 时中断 4.1us(几乎不执行代码),
+       一旦进位置环就 23~30us —— 差 6~7 倍, 而代码量并没有增加 6 倍。
+
+       这三句是纯性能开关, 对程序完全透明, 不改任何控制逻辑/时序:
+         · ICEN  = 指令缓存(1KB), 循环体/热点函数不再反复等 Flash
+         · DCEN  = 数据缓存(1KB), sin/cos 表、PID 系数等常量读命中
+         · PRFTEN= 预取缓冲
+       回归方法: 把这三句注释掉就回到原状态。 */
+    __HAL_FLASH_INSTRUCTION_CACHE_ENABLE();
+    __HAL_FLASH_DATA_CACHE_ENABLE();
+    __HAL_FLASH_PREFETCH_BUFFER_ENABLE();
 }

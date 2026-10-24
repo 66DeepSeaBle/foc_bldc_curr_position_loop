@@ -30,6 +30,7 @@
 #define __BOARD_CONFIG_H__
 
 #include "main.h"
+#include "foc_types.h"   /* 只为拿到 FOC_CTRL_HZ(控制拍频唯一真源) */
 
 /* ==========================================================================
  * 1) 平台选择
@@ -73,8 +74,10 @@
  * ========================================================================== */
 #define CFG_PWM_TIM_HANDLE        htim1
 #define CFG_PWM_TIM               TIM1
-#define CFG_PWM_FREQ_HZ           20000.0f  /* 中心对齐 PWM 频率 */
-#define CFG_CTRL_FREQ_HZ          20000.0f  /* FOC 控制环频率(= ADC 注入中断频率) */
+/* ★ 2026-10-24: PWM / 控制频率统一由 foc_types.h 的 FOC_CTRL_HZ 决定
+   (改频只改那一处; tim.c 的 htim1.Init.Period 也需同步改) */
+#define CFG_PWM_FREQ_HZ           ((float)FOC_CTRL_HZ)  /* 中心对齐 PWM 频率 */
+#define CFG_CTRL_FREQ_HZ          ((float)FOC_CTRL_HZ)  /* FOC 控制环频率(= ADC 注入中断频率) */
 #define CFG_PWM_DEADTIME_NS       500       /* 死区, 与 tim.c 里 DeadTime 一致 */
 #define CFG_PWM_MAX_DUTY          0.95f     /* 单相占空比上限(留开关裕量) */
 

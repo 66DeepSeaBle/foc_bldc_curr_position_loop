@@ -41,7 +41,7 @@ float PositionLoop_Update(PositionLoop_t *loop,
     loop->pos_err_deg = pos_err;
 
     /* ---- ???? (??) ---- */
-    arrive_ticks = (uint32_t)((float)loop->arrive_ms * 20000.0f / 1000.0f);
+    arrive_ticks = (uint32_t)((float)loop->arrive_ms * (float)FOC_CTRL_HZ / 1000.0f);
     if (fabsf(pos_err) < loop->arrive_tol_deg) {
         if (loop->arrived_tick == 0) {
             loop->arrived_tick = now_tick;

@@ -23,7 +23,7 @@
 #if (CFG_SENSOR_TYPE == CFG_SENSOR_HALL)
 
 /* 轮询参数(原样沿用 main.c 里的实机调好的值) */
-#define HALL_POLL_MIN_DT_TICKS   4.0f       /* 边沿最小间隔 4 拍(200µs) 防抖 */
+#define HALL_POLL_MIN_DT_TICKS   (0.0002f * (float)FOC_CTRL_HZ)  /* 边沿最小间隔 200µs 防抖 */
 #define HALL_POLL_MAX_ERPM       3000.0f    /* 速度上限 */
 #define HALL_POLL_DT_S           1.5e-5f    /* 50µs 的一拍(含余量) */
 

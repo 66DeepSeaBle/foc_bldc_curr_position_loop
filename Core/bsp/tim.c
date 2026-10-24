@@ -139,6 +139,9 @@ void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
+  /* ★ 中心对齐: f = 170MHz / (2 * (Period+1))
+     20kHz ⇒ 4249 ; 15kHz ⇒ 5666 ; 16kHz ⇒ 5311 ; 25kHz ⇒ 3399
+     16kHz: 170e6/(2*5312) = 16001.5Hz。**改频必须与 foc_types.h 的 FOC_CTRL_HZ 同步**。 */
   htim1.Init.Period = 4249;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
@@ -190,7 +193,15 @@ void MX_TIM1_Init(void)
      4200/4250≈98% 的相，上管都已关断、下管导通，三路分流电阻同时有电流。
      注意：占空比很高时下管导通窗口会缩短，需保证窗口长于ADC采样时间
      （47.5+12.5=60个ADC周期 ≈ 2.8us/通道）。 */
-  sConfigOC.Pulse = 4200;
+  /* ★★★ 2026-10-24 严重 bug 修正: CCR4 必须**跟着 ARR 走**。
+     原来硬编码 4200 是 20kHz(ARR=4249) 专用值。改成 25kHz(ARR=3399) 后
+     4200 > ARR ⇒ CCR4 永远匹配不到 ⇒ OC4REF 不再产生边沿 ⇒
+     **ADC 注入中断彻底停摆**(实测: cntU/V/W=0, offU/V/W=0, 卡在 ALIGN)。
+     改成 98.85% × ARR（= 20kHz 时正好 4199，与原来的 4200 等价）:
+       · 仍落在峰顶之后（< ARR）
+       · 仍大于最大占空比 CFG_PWM_MAX_DUTY(0.95) 对应的 CCR ⇒ 采样时上管已全关
+     20kHz⇒4199  15kHz⇒5601  25kHz⇒3359 */
+  sConfigOC.Pulse = (uint32_t)((float)htim1.Init.Period * 0.9885f);
   if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
   {
     Error_Handler();

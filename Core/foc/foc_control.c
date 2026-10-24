@@ -7,6 +7,7 @@
 #include "pid.h"
 #include "sensor.h"      /* 位置传感器抽象: ALIGN 零点标定走 g_sensor(换编码器不用改这里) */
 #include "log.h"
+#include "board_config.h"   /* 仅为拿 CMSIS 的 DWT(CYCCNT) 做分段计时(2026-10-24) */
 #include <math.h>
 
 /* ---- 各状态的执行体(每拍一个) ---- */
@@ -37,7 +38,136 @@ static uint8_t s_pwm_on = 0;
 static uint8_t  s_oc_cnt = 0;
 static uint32_t s_pwm_on_tick = 0;
 static const uint8_t  OC_DEBOUNCE = 4U;
-static const uint32_t OC_BLANK_TICKS = 2000U;   /* 20kHz 下 = 100ms */
+static const uint32_t OC_BLANK_TICKS = (100U * FOC_TICKS_PER_MS);   /* = 100ms */
+
+/* ==========================================================================
+ * ★ 2026-10-24 到位静音: 用来判定“静止啸叫”是不是 PWM 载波引起的
+ * --------------------------------------------------------------------------
+ * 现象(15kHz 日志铁证): 到位后 `arr=1 / Iqref=0.00`, 但 `du=0.500`
+ *   ⇒ 三相半桥仍在硬开关 ⇒ 绕组对地 ±12V 方波(相间电压≈零, 没有真电流)
+ *   ⇒ 磁致伸缩啸叫, **与电流大小无关**; 20k/15k 只是换了音调。
+ * 做法: 位置环已到位 + 轨迹没在跑 + |iq_ref| 很小 + |err| < 1.5°,
+ *      连续 ARM_TICKS(150ms) 满足 ⇒ PWM_Output_Disable() 三相全关。
+ * 恢复: |iq_ref| 变大 / 位置漂出 1.5° / 状态离开位置环 / 轨迹启动
+ *      ⇒ 立刻重新使能(下一次 PWM_Output_Apply 自己会打开 CCER)。
+ * 运行时开关: 大写 'A' 切换(FOC_Control_SetPwmIdleOff)。
+ * ========================================================================== */
+#define PWM_IDLE_OFF_DEG        4.0f    /* 进入门限: 必须 > DONE_DEG(3.0)——静止读数常停在 2~3° */
+#define PWM_IDLE_OFF_EXIT_DEG   6.0f    /* 退出门限(滞环): 漂出它才重新使能 */
+#define PWM_IDLE_OFF_CUR_A      0.06f   /* |iq_ref| 超它就重新使能 */
+#define PWM_IDLE_OFF_ARM_TICKS  (150U * FOC_TICKS_PER_MS)   /* 零电流持续 150ms 才关断 */
+static uint8_t  s_pwm_idle_en   = 1U;   /* 1 = 允许到位关 PWM(**默认开启**, 按 'A' 关) */
+static uint8_t  s_pwm_idle_off  = 0U;   /* 1 = 当前已关断 */
+static uint32_t s_pwm_idle_tick = 0U;
+
+/* ★ 2026-10-24: 关断/使能事件改为"只置标志", 由主循环打印
+   实测: 原来在中断里 LOGD(走 vsnprintf + RTT) 会把那一拍的 CUR 从
+   8.3us 拉到 17us —— 这是 [PROF] 里 max 虚高的主因之一。 */
+static uint8_t  s_pwm_evt      = 0U;    /* 0=无 1=idle-off 2=idle-on */
+static int32_t  s_pwm_evt_pos  = 0;
+static int32_t  s_pwm_evt_err  = 0;
+
+/* ★ 2026-10-24 位置律耗时统计(DWT 打点, 只给 [PROF] 诊断用, 不参与控制)
+   s_law_t0 在分频门里置位, 在外层律结束时相减 ⇒ 得到“外层位置律独占”的周期数。
+   目的: 搞清 43 µs 的最坏一拍到底是 轨迹/爬行/电流环 哪一块占的, 再决定搬哪块。 */
+static uint32_t s_law_t0      = 0U;
+static uint32_t s_law_cyc_sum = 0U;
+static uint32_t s_law_cyc_max = 0U;
+static uint32_t s_law_cyc_cnt = 0U;
+
+/* ★ 2026-10-24 拆分计时的另两段
+     PRE: FOC_DoPositionLoop 入口 → 分频门(每拍都跑)
+     CUR: FOC_UpdateCurrent 全程(每拍都跑) */
+static uint32_t s_pre_t0      = 0U;
+static uint32_t s_pre_cyc_sum = 0U;
+static uint32_t s_pre_cyc_max = 0U;
+static uint32_t s_pre_cyc_cnt = 0U;
+static uint32_t s_cur_cyc_sum = 0U;
+static uint32_t s_cur_cyc_max = 0U;
+static uint32_t s_cur_cyc_cnt = 0U;
+
+/* ANG: FOC_UpdateAngle(角度观测器)单独计时 —— 用来把 PRE 再拆一刀 */
+static uint32_t s_ang_cyc_sum = 0U;
+static uint32_t s_ang_cyc_max = 0U;
+static uint32_t s_ang_cyc_cnt = 0U;
+
+static float s_cur_dt_s = 0.0f;   /* 电流环的 dt_s = 1/pwm_freq(常量, 缓存) */
+
+static void FOC_ProfAcc(uint32_t cyc, uint32_t *sum, uint32_t *pmax, uint32_t *cnt)
+{
+    *sum += cyc;
+    (*cnt)++;
+    if (cyc > *pmax) { *pmax = cyc; }
+}
+
+void FOC_Control_SetPwmIdleOff(uint8_t en)
+{
+    s_pwm_idle_en = en ? 1U : 0U;
+    s_pwm_idle_tick = 0U;
+}
+
+uint8_t FOC_Control_GetPwmIdleOff(void)
+{
+    return s_pwm_idle_en;
+}
+
+uint8_t FOC_Control_GetPwmIdleOffActive(void)
+{
+    return s_pwm_idle_off;
+}
+
+/* 读并清零拆分计时(主循环调) */
+void FOC_Control_TakeSplitProf(FOC_SplitProf_t *out)
+{
+    uint32_t pre_s, pre_m, pre_c;
+    uint32_t ang_s, ang_m, ang_c;
+    uint32_t law_s, law_m, law_c;
+    uint32_t cur_s, cur_m, cur_c;
+
+    if (out == 0) { return; }
+
+    __disable_irq();
+    pre_s = s_pre_cyc_sum;  s_pre_cyc_sum = 0U;
+    pre_m = s_pre_cyc_max;  s_pre_cyc_max = 0U;
+    pre_c = s_pre_cyc_cnt;  s_pre_cyc_cnt = 0U;
+    ang_s = s_ang_cyc_sum;  s_ang_cyc_sum = 0U;
+    ang_m = s_ang_cyc_max;  s_ang_cyc_max = 0U;
+    ang_c = s_ang_cyc_cnt;  s_ang_cyc_cnt = 0U;
+    law_s = s_law_cyc_sum;  s_law_cyc_sum = 0U;
+    law_m = s_law_cyc_max;  s_law_cyc_max = 0U;
+    law_c = s_law_cyc_cnt;  s_law_cyc_cnt = 0U;
+    cur_s = s_cur_cyc_sum;  s_cur_cyc_sum = 0U;
+    cur_m = s_cur_cyc_max;  s_cur_cyc_max = 0U;
+    cur_c = s_cur_cyc_cnt;  s_cur_cyc_cnt = 0U;
+    __enable_irq();
+
+    out->pre_avg = (pre_c != 0U) ? (pre_s / pre_c) : 0U;
+    out->pre_max = pre_m;
+    out->pre_n   = pre_c;
+    out->ang_avg = (ang_c != 0U) ? (ang_s / ang_c) : 0U;
+    out->ang_max = ang_m;
+    out->ang_n   = ang_c;
+    out->law_avg = (law_c != 0U) ? (law_s / law_c) : 0U;
+    out->law_max = law_m;
+    out->law_n   = law_c;
+    out->cur_avg = (cur_c != 0U) ? (cur_s / cur_c) : 0U;
+    out->cur_max = cur_m;
+    out->cur_n   = cur_c;
+}
+
+/* ★ 2026-10-24: 取走待打印的 PWM 关断/使能事件(主循环调, 读即清) */
+uint8_t FOC_Control_TakePwmEvent(int32_t *pos_mdeg, int32_t *err_mdeg)
+{
+    uint8_t ev;
+
+    __disable_irq();
+    ev = s_pwm_evt;
+    s_pwm_evt = 0U;
+    if (pos_mdeg != 0) { *pos_mdeg = s_pwm_evt_pos; }
+    if (err_mdeg != 0) { *err_mdeg = s_pwm_evt_err; }
+    __enable_irq();
+    return ev;
+}
 
 /* 开环速度测试参数. 全部只用"电流幅值"做判断, 对 dq 符号/相序免疫. */
 /* 段0 升压上限 (占空比量).
@@ -335,7 +465,7 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
     /* ????? */
     FOC_UpdateCurrent(foc);
 
-    if (elapsed > align_ms * 20U) {
+    if (elapsed > align_ms * FOC_TICKS_PER_MS) {
         foc->align_done = 1;
         foc->flags.aligned = 1;
         /* 对齐结束: 此刻 theta 被强制为 0°, 转子 d 轴就停在该电角度上, 而霍尔
@@ -395,9 +525,9 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
     elapsed = foc->tick - foc->startup_tick;
 
     /* ??????? */
-    if (elapsed < startup_ms * 20U) {
+    if (elapsed < startup_ms * FOC_TICKS_PER_MS) {
         omega_target = 2.0f * 3.14159265f * target_hz / foc->config.pwm_freq *
-                       (float)elapsed / (float)(startup_ms * 20U);
+                       (float)elapsed / (float)(startup_ms * FOC_TICKS_PER_MS);
     } else {
         omega_target = 2.0f * 3.14159265f * target_hz / foc->config.pwm_freq;
     }
@@ -421,7 +551,7 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
        "转多快", 只要霍尔有效即可(原来卡 >20, 实测拖转只有 ~13 就判失败). */
     if (foc->angle.synced &&
         foc->hall.state >= 1U && foc->hall.state <= 6U &&
-        elapsed > 6000U && fabsf(erpm) > 8.0f) {
+        elapsed > (300U * FOC_TICKS_PER_MS) && fabsf(erpm) > 8.0f) {
         float pos;
         foc->startup_done = 1;
         foc->flags.hall_synced = 1;
@@ -434,7 +564,7 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
            展开器对齐到扇区角), 再清零连续电角度. 否则 I-F 期间被开环直接
            改写的 theta 会在交接后第一次展开时被当成一次大跳变. */
         (void)AngleObserver_GetTheta(&foc->angle, &foc->hall, foc->tick,
-                                     foc->config.pwm_freq, 20000U, 1.0f, 1, NULL);
+                                     foc->config.pwm_freq, FOC_TICKS_PER_S, 1.0f, 1, NULL);
         /* 2026-10-11c: 位置现在是绝对值算法, 清零要搬参考点(写 elec_acc_deg
            会在下一拍被覆盖) */
         AngleObserver_ZeroPos(&foc->angle);
@@ -464,7 +594,7 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
         return;
     }
 
-    if (elapsed > max_ms * 20U) {
+    if (elapsed > max_ms * FOC_TICKS_PER_MS) {
         LOGW("[STARTUP] Timeout, hall not synced\n");
         foc->state = FOC_STATE_FAULT;
         foc->fault_code = 0x0002;
@@ -637,7 +767,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
 #define POS_HOLD_OUT_DEG     13.0f/* 进入死区前 "|err| 连续在容差内" 的时长. 用**时间**而不是瞬时速度判断
    "停下来了没有" —— 因为本机速度反馈在目标附近全是尖刺, 用不了。
    飞掠(300~600°/s)穿过 ±6° 只停 ~40ms, 而真停住会持续几百ms ✓ 区分得开。 */
-#define POS_HOLD_SETTLE_TICKS (100U * 20U)
+#define POS_HOLD_SETTLE_TICKS (100U * FOC_TICKS_PER_MS)
 
 /* ★★★ cal25 位置律分频（省 CPU）
  * --------------------------------------------------------------------------
@@ -685,10 +815,10 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    让齿槽自己把转子接住 —— 不推、也不刹(这 250ms 里的速度估计没有意义)。
    触发条件刻意选成"上一条边沿间隔 >100ms": 那说明这是一次**从静止起步的
    离散小步**, 而不是 30ms 一条边沿的高速飞掠 ⇒ 高速进近时照旧由刹车接管。 */
-#define POS_SETTLE_TICKS      (150U * 20U)   /* 松手静默时长
+#define POS_SETTLE_TICKS      (150U * FOC_TICKS_PER_MS)   /* 松手静默时长
                                              ★ cal26: 250→150ms。到点回弹后这 250ms
                                              里一直是撤力状态, 是 0.77s 恢复时间的一半。 */
-#define POS_SETTLE_SLOW_DT    (100U * 20U)   /* 上一条边沿间隔 > 它 ⇒ 视为"离散小步" */
+#define POS_SETTLE_SLOW_DT    (100U * FOC_TICKS_PER_MS)   /* 上一条边沿间隔 > 它 ⇒ 视为"离散小步" */
 #define POS_SETTLE_ARM_DEG    10.0f          /* 只在 |err|< 它 时触发(近目标) */
 /* ★★ 2026-10-11ai 近目标“只允许不足以起步的电流”
    本机实测破黏 1.15~1.6A、滑动摩擦 ≈1.18A。把近目标(|err|<35°)的电流卡在
@@ -709,7 +839,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    hall.dir —— 离散量, 不会被 ±1600eRPM 的假速度带错), 而且只在最后
    POS_SOFT_BRAKE_DEG(~12°) 内生效: 这里刚好是“冲过一格”与“停早了”的分界。 */
 #define POS_DIR_RUN_MIN       3U              /* 连续同向边沿数阈值(≈3 个扇区=47°) */
-#define POS_DIR_RUN_TICKS     (100U * 20U)    /* 且最后边沿在 100ms 内(⇒ >≈155°/s) */
+#define POS_DIR_RUN_TICKS     (100U * FOC_TICKS_PER_MS)    /* 且最后边沿在 100ms 内(⇒ >≈155°/s) */
 #define POS_SOFT_BRAKE_DEG    12.0f           /* 只有最后 ~12° 内允许满力刹车 */
 /* ★★ 2026-10-11ai 位置读数跳变 ⇒ 立即撤力
    `s_pos_jump_cnt` 是已有的“物理上不可能的位移”计数器(10ms 窗口里位移超过
@@ -719,8 +849,8 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    来(停下后霍尔就不再抖、读数自然恢复), 再重新评估。
    `..._MAX_TICKS` 是安全帽: 连续跳变最多只让环路安静这么久, 之后必须
    重新介入(防止两个齿槽边界永久互刷导致环路永久罢工)。 */
-#define POS_FREEZE_TICKS      (150U * 20U)
-#define POS_FREEZE_MAX_TICKS  (400U * 20U)
+#define POS_FREEZE_TICKS      (150U * FOC_TICKS_PER_MS)
+#define POS_FREEZE_MAX_TICKS  (400U * FOC_TICKS_PER_MS)
 /* ★★ 2026-10-11q 测速"物理可信度限速": 本机最大加速度实测 ~25000°/s²
    (= 167eRPM/10ms = 0.83eRPM/tick), 所以**每一拍**测速不可能变超过几个 eRPM。
    但位置读数偶尔会整扇区误跳(扇区序号判错/边界抖动), 位置差分就会在 10ms
@@ -761,7 +891,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    ⇔ 靠摩擦只要 0.45° 就滑完 ⇒ 当"停了"处理绝对安全。
    ⭐ 关键认识: 转子真在动时, 偏大的速度估计只会"多刹一点"(安全方向);
      只有"停着却报大速度"才危险 —— 用净扇区数可以干净地把这两件事分开。 */
-#define POS_SECT_WIN_TICKS   4000U    /* 200ms 扇区观察窗 */
+#define POS_SECT_WIN_TICKS   (200U * FOC_TICKS_PER_MS)   /* 200ms 扇区观察窗 */
 /* ★★ 2026-10-11w 两个档的扇区数阀值(见 POS_SOFT_ZONE_DEG 注释):
    200ms 净跨 1 个扇区 ⇔ 平均 ≥77°/s=52eRPM(在动); 2 个 ⇔ ≥155°/s=103eRPM(真的在飞)。 */
 #define POS_MOVE_SECT_MIN    1
@@ -818,7 +948,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
 #define POS_SOFT_OFF_DEG      6.0f
 #define POS_SOFT_IQ_MAX_A     1.60f
 #define POS_SOFT_STEP_A       0.10f
-#define POS_SOFT_RAMP_TICKS   4000U   /* 每 200ms 没进展 +0.10A(按时间上爬, 保留兼容) */
+#define POS_SOFT_RAMP_TICKS   (200U * FOC_TICKS_PER_MS)  /* 每 200ms 没进展 +0.10A(按时间上爬, 保留兼容) */
 /* ★★ 2026-10-11y 爬行的退出改成"**按位移**"
    ----------------------------------------------------------
    实测(10-11x 日志): 靠 `|err|<8` / `flying` / 变号 退出太慢 ——
@@ -837,7 +967,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    真正在起作用的只有"位移 8°"那一条, 而位移是按**读数**算的(边界附近虚偏
    ±5°)。电流上爬到 2.0A 时, 80ms 的行程会从 4° 涨到 30°(≈两格) ⇒ 就是
    用户看到的"推一下、冲两格、再推"。改成"等冲量"(电流越大脉宽越短)。 */
-#define POS_SOFT_PUSH_TICKS   (80U * 20U)    /* 单次推动最长 80ms(等冲量: 电流越大越短) */
+#define POS_SOFT_PUSH_TICKS   (80U * FOC_TICKS_PER_MS)    /* 单次推动最长 80ms(等冲量: 电流越大越短) */
 /* ★★ 2026-10-11y 防抖: 进入爬行前必须有最短间隔, 两次"计一次尝试"也必须隔得够久
    实测(10-11x 日志): 快速摆动中读数反复跨过 15° 门槛又变号
      ⇒ **400ms 里就计了 4 次尝试** ⇒ 误判 GIVE UP ⇒ 之后 5 秒环路完全罢工,
@@ -845,12 +975,12 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
      `Tgt=45` 停在 29.21 全是这个原因)。
    现在: ① 上一次推动结束后至少等 300ms 才允许再推;
          ② 两次**计数**至少隔 600ms ⇒ 最快也要 2.4s 才认输(真正做到 4 次尝试)。 */
-#define POS_SOFT_RETRY_TICKS   (200U * 20U)
-#define POS_HOP_TRY_MIN_TICKS  (600U * 20U)
+#define POS_SOFT_RETRY_TICKS   (200U * FOC_TICKS_PER_MS)
+#define POS_HOP_TRY_MIN_TICKS  (600U * FOC_TICKS_PER_MS)
 /* ★★ 2026-10-11aa 认输后"再试一轮"的间隔(见爬行块里的注释)。
    认输**不再是永久的** —— 实测认输后环路永久静默 3.1 秒以上, 只在日志里
    留下一个 15.47° 的静差, 而用户看到的却是"到位置后不再动"。 */
-#define POS_SOFT_GIVE_RETRY_TICKS (1500U * 20U)
+#define POS_SOFT_GIVE_RETRY_TICKS (1500U * FOC_TICKS_PER_MS)
 /* ★★ 2026-10-11ab "停稳"才允许推: 距上一条霍尔边沿超过它(≈KICK 的堵转阀值)。
    实测(10-11aa 日志)转子在目标附近以 10~50ms 一条边沿的节律抖动时, 爬行
    每 300~900ms 还是推一次 ⇒ 每一次破黏都把转子抡出 20~40°, 再被推回来 ——
@@ -858,7 +988,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
 /* ★★ 2026-10-11ah 400→200ms: 上面那条"停稳才推"的保护现在由**松手静默**
    (POS_SETTLE_TICKS)接了一部分班(每次跨边界后强行撤力 250ms), 所以这里的
    等待可以缩短, 否则一次 16.66° 的爬行要等 3~4 轮 ×400ms 才走完。 */
-#define POS_SOFT_QUIET_TICKS   (200U * 20U)
+#define POS_SOFT_QUIET_TICKS   (200U * FOC_TICKS_PER_MS)
 /* ★★ 2026-10-11ad "转子确实在动"的判据 —— 距上一条霍尔边沿 < 它。
    为什么必须再加这一条(实测 10-11ac 两份日志): 位置环的 `v` 原来只有
    `s_pos_flying`(需连续 2 个 200ms 窗口净跨≥2 扇区) 和 `s_pos_move` 两条路,
@@ -871,7 +1001,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
         转子带着 ~1000eRPM 撞进齿槽 ⇒ 齿槽擒不住 ⇒ 甩过去再弹回来
         = 用户看到的"大角度到位后短暂抖动"(小角度距离短、速度低所以不明显)。
    ⇒ 用"最近有边沿"作第三条判据: 最直接(边沿=转子真的动过)、无滞后。 */
-#define POS_EDGE_MOVE_TICKS   (80U * 20U)
+#define POS_EDGE_MOVE_TICKS   (80U * FOC_TICKS_PER_MS)
 /* ★★ 2026-10-11ae 定时轨迹(命令 `t<角度> d<秒>` + 回车)
    --------------------------------------------------
    需求: 给定目标角度与"到达目标需要的时间"(秒), 把**时间**分成 9 份:
@@ -1099,10 +1229,10 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
    这样“末速归零”才真正实现, 齿槽能直接捣住。 */
 #define POS_TM_KV_A_PER_ERPM    0.030f   /* 轨迹期间速度环增益(A/eRPM) */
 #define POS_TM_DONE_DEG         3.0f     /* |err| 小于它 ⇒ 轨迹交由普通逻辑收尾 */
-#define POS_TM_TAIL_TICKS       (1500U * 20U)  /* 收尾段最长再扰 1.5s */
+#define POS_TM_TAIL_TICKS       (1500U * FOC_TICKS_PER_MS)  /* 收尾段最长再扰 1.5s */
 /* ★ cal19 新增两个量 */
 #define POS_TM_START_DEG        12.0f    /* 起步破黏窗口: 离起点不足它就给静摩擦 */
-#define POS_TM_END_QUIET_TICKS  (120U * 20U) /* ★ cal30: 60→120ms 无霍尔边沿才结束
+#define POS_TM_END_QUIET_TICKS  (120U * FOC_TICKS_PER_MS) /* ★ cal30: 60→120ms 无霍尔边沿才结束
                                              等效“已慢于 **~129°/s**”—— 这是关键:
                                              60ms 只等效 <258°/s, 而实测到位余速
                                              257°/s 恰好卡在它旁边(cal29 t=25863),
@@ -1113,16 +1243,6 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
 /* ★ 2026-10-11ab 齿槽能“擒住”的速度上限(实测 ~130eRPM): 位置环拿它当
    "需不需要刹"的门槛 —— 低于它转子会被齿槽自己接住, 高于它一定冲过目标。 */
 #define POS_CAPTURE_ERPM      150.0f
-/* ★★★ cal32: “中途卡住”的判据(轨迹位置误差, °)
-   ------------------------------------------------------------------
-   cal31 的 45° 实测(按键 1/3/5/7 全部中招): 转子走出一个齿槽(15.47°)就落地,
-   而 hw=1 的窗口要求 `|pos-deg0| < 12°` ⇒ **一落地就出窗** ⇒ 整段只剩滑动
-   摩擦 0.20A ⇒ 推不动 ⇒ 卡 190ms 等 trim 攒到 1.2A 才脱开 ⇒ 一下跳 29°:
-     t=9219 Pos=15.47 tv=-1.2 Iqref=0.14   ← 动不了
-     t=9411 Pos=15.48 tv=+29.0 Iqref=1.21  ← trim 攒够了
-     t=9513 Pos=44.48 tv=+0.5  Iqref=-0.27 ← 102ms 跳 29°(284°/s), 冲过齿槽
-   取 8.0°: 大于半个扇区(7.74° = 读数噪声上限)、小于一个齿槽(15.47°)。 */
-#define POS_TM_STALL_DEG        8.0f     /* 卡住判据: |verr| 超过它且转子未动 */
 /* 位置积分(现在只是静态误差微调, 摩擦已由前馈承担) */
 #define POS_INTEG_MAX_A      0.8f
 /* 总限幅与阻尼限幅必须同时抬到 2.5A(2026-10-09f): 实测冲过目标的机理是
@@ -1138,7 +1258,7 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
 #define POS_DAMP_TAU_S       0.012f  /* 阻尼用速度低通时间常数(原 0.1s 太慢) */
 #define POS_DAMP_MAX_A       2.5f    /* 阻尼项限幅(曾 0.7/1.4, 见上面注释) */
 #define POS_INTEG_GATE_ERPM  40.0f   /* |v| 超过它就算"在动", 积分冻结 */
-#define POS_INTEG_STALL_TICKS (150U * 20U)   /* 另有此条: 150ms 无霍尔边沿才算堵转 */
+#define POS_INTEG_STALL_TICKS (150U * FOC_TICKS_PER_MS)   /* 另有此条: 150ms 无霍尔边沿才算堵转 */
 /* ⚠ 2026-10-11b 再加一条: "想动"持续 POS_INTEG_ARM_TICKS 之后积分才被允许增长。
    光靠"150ms 无边沿"不够 —— 换目标的一瞬间转子本来就静止(停在旧目标上),
    天然满足"150ms 无边沿" ⇒ 积分会从第 150ms 就开始按 0.10×90°=9A/s 往上顶
@@ -1146,7 +1266,7 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
    立刻要求运动(v_tgt≠0), 但积分要等 300ms 才"开闸", 那之前转子早该动起来
    (有霍尔边沿 ⇒ 堵转条件不成立 ⇒ 积分冻结); 只有真的卡在齿槽里不动,
    "想动 300ms + 150ms 无边沿" 才同时成立 ⇒ 积分只做"破齿槽助手"。 */
-#define POS_INTEG_ARM_TICKS   (300U * 20U)   /* "想动"多久才允许积分增长 */
+#define POS_INTEG_ARM_TICKS   (300U * FOC_TICKS_PER_MS)   /* "想动"多久才允许积分增长 */
 
 /* ---- 堵转破黏脉冲 (2026-10-09) ----
    实测日志: Tgt=90 时转子冲过头到 105.47° 后卡死, 800ms 没有霍尔边沿, 而
@@ -1165,7 +1285,7 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
      1.9A×0.2s ≈ 0.38A·s 能出来, 2.8A×0.1s = 0.28A·s 出不来。
    250ms×2.5A = 0.63A·s ⇒ 有安全余量; 速度一过 POS_KICK_EXIT_ERPM 或
    一见到霍尔边沿就提前松手(下面逻辑里都有), 所以不会失控。 */
-#define POS_KICK_TICKS          (250U * 20U)
+#define POS_KICK_TICKS          (250U * FOC_TICKS_PER_MS)
 /* ★ 2026-10-11l 认输阀值: 连续多少次脉冲"打完仍无霍尔边沿"就判定机构推不动。
    实测(10-11k 日志) #6...#14 连续 9 次脉冲、每次都实际给出 2.5~2.8A、
    转子一点不动 ⇒ 不是控制问题(要么机构卡死/负载过大, 要么力矩根本
@@ -1206,7 +1326,7 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
    "推一下→读数翻号→反推一下" = 用户看到的小幅振动。所以近目标且符号
    刚翻过时, 一律不给任何电流, 等符号稳定下来再说。 */
 #define POS_HOLD_BAND_DEG       10.0f
-#define POS_ERR_HYST_TICKS      (150U * 20U)
+#define POS_ERR_HYST_TICKS      (150U * FOC_TICKS_PER_MS)
 /* ★ 2026-10-11r 破黏脉冲的最小误差 10°→20°(整一个齿槽以上)。
    实测(10-11p 日志) 误差 -14.5° 时打的 2.0A×250ms 脉冲, 把转子一口气甩出去
    120°(54.21→-60.79, 正好一个整圈的电角度), 之后环路在 105° 的偏差上
@@ -1258,7 +1378,7 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
 #define POS_ACCEPT_BAND_DEG      8.0f
 /* 脱困刹车只在该刹的时候给(时长由 POS_ESCAPE_BRAKE_TICKS 定) */
 #define POS_ESC_BRAKE_V_ERPM    60.0f
-#define POS_ESC_BRAKE_MIN_TICKS (25U * 20U)
+#define POS_ESC_BRAKE_MIN_TICKS (25U * FOC_TICKS_PER_MS)
 /* ★10-11m 超速保险门限(eRPM): 超过它一律满刹车 */
 #define POS_OVERSPEED_ERPM     250.0f
 /* ★ 2026-10-11h: 破黏脉冲**一见转动就收手**(|v| 超过它就不再强搭)。
@@ -1272,9 +1392,9 @@ static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
    无法控制的。既然齿槽间距就是 15.5°，最巧的策略就是:
      **从齿槽脱困→让它走一个齿槽→立刻全刹车** ⇒ 刚好停在下一个齿槽。
    而"卡在目标旁一个齿槽"正是最常见的工况 ⇒ 一次就到位。 */
-#define POS_ESCAPE_BRAKE_TICKS (60U * 20U)
-#define POS_KICK_STALL_TICKS   (400U * 20U)    /* 判"堵转"的静止时长 */
-#define POS_KICK_COOLDOWN_TICKS (800U * 20U)   /* 两次脉冲最小间隔 */
+#define POS_ESCAPE_BRAKE_TICKS (60U * FOC_TICKS_PER_MS)
+#define POS_KICK_STALL_TICKS   (400U * FOC_TICKS_PER_MS)    /* 判"堵转"的静止时长 */
+#define POS_KICK_COOLDOWN_TICKS (800U * FOC_TICKS_PER_MS)   /* 两次脉冲最小间隔 */
 
 /* 位置环积分项(A) 与 阻尼用滤波速度(eRPM) */
 static float s_pos_integ = 0.0f;
@@ -1369,7 +1489,7 @@ static uint32_t s_pos_err_run_tick = 0U;
    ⇒ err=44 那个区间**两条路都进不去** ⇒ 永久死锁。现在静默一段时间后自动
    重试(4 次全力脉冲都推不动的状态也可能是暂时的: 机构被异物卡住后又松开/
    手动拨了一下/换相方向错等), 保证环路永远不会永久不出力。 */
-#define POS_BLOCK_RETRY_TICKS  (3000U * 20U)
+#define POS_BLOCK_RETRY_TICKS  (3000U * FOC_TICKS_PER_MS)
 
 /* 位置环"飞车"计时: 滤波速度持续超过门限的拍数 */
 static uint32_t s_pos_fast_cnt = 0U;
@@ -1472,6 +1592,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
     int8_t saved_torque;
     uint32_t err_run = 0U;   /* "err 已连续超差"的拍数(见下面的堵转看门狗) */
 
+    s_pre_t0 = DWT->CYCCNT;  /* ★ 拆分计时: PRE 段的起点 */
     /* ★ 2026-10-11ag "机构推不动"只当 3s, 之后自动重试(见 POS_BLOCK_RETRY_TICKS) */
     if (s_pos_blocked_hard &&
         (foc->tick - s_pos_block_tick) > POS_BLOCK_RETRY_TICKS) {
@@ -1480,7 +1601,12 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         LOGD("[POS] BLOCK retry: allowing pushes again\r\n");
     }
     /* ??????? */
-    FOC_UpdateAngle(foc, &erpm_now);
+    {
+        uint32_t at0 = DWT->CYCCNT;      /* ★ 角度更新单独计时(ANG) */
+        FOC_UpdateAngle(foc, &erpm_now);
+        FOC_ProfAcc(DWT->CYCCNT - at0,
+                    &s_ang_cyc_sum, &s_ang_cyc_max, &s_ang_cyc_cnt);
+    }
 
     /* ---- 开环力矩探针 ----
        绕过位置/转速环, 直接施加恒定 iq 脉冲(期间强制 torque_dir=+1,
@@ -1546,9 +1672,9 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
        绝不低估(低估 = 跑飞/冲过头)。 */
     {
         uint32_t dtk = foc->tick - s_pos_vdiff_tick;
-        if (dtk >= 200U) {                                   /* 10ms 窗口 */
+        if (dtk >= (10U * FOC_TICKS_PER_MS)) {               /* 10ms 窗口 */
             float dth   = pos_now_deg - s_pos_vdiff_deg;
-            float v_pos = dth / (float)dtk * 20000.0f / 1.5f;   /* deg/s → eRPM */
+            float v_pos = dth / (float)dtk * (float)FOC_CTRL_HZ / 1.5f;   /* deg/s → eRPM */
             float maxj  = (s_pos_win10_edges == 0U)
                               ? POS_WIN_N0_MAX_DEG
                               : (((float)s_pos_win10_edges + 0.7f) * POS_SECTOR_DEG);
@@ -1613,7 +1739,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
             }
             s_pos_flying = (s_pos_fly_cnt >= 2U) ? 1U : 0U;
             s_pos_v_sect = (float)dsect * POS_SECTOR_DEG
-                           / ((float)dtk / 20000.0f) / 1.5f;   /* 诊断(eRPM) */
+                           / ((float)dtk / (float)FOC_CTRL_HZ) / 1.5f;   /* 诊断(eRPM) */
         }
     }
 
@@ -1633,7 +1759,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
     }
     if (fabsf(s_pos_erpm_filt) > 1500.0f) {
         s_pos_fast_cnt++;
-        if (s_pos_fast_cnt > 4000U) {
+        if (s_pos_fast_cnt > (200U * FOC_TICKS_PER_MS)) {
             LOGW("[POS] RUNAWAY: |vsp|=%deRPM -> FAULT\r\n", (int)s_pos_erpm_filt);
             FOC_Control_SetFault(foc, 0x0011);
             s_pos_fast_cnt = 0U;
@@ -1662,11 +1788,12 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         err_run = (s_pos_err_run_tick == 0U) ? 0U
                                              : (foc->tick - s_pos_err_run_tick);
 
-        if (err_run > 16000U && since_edge > 16000U) {
+        if (err_run > (800U * FOC_TICKS_PER_MS) &&
+            since_edge > (800U * FOC_TICKS_PER_MS)) {
             if (!s_pos_blocked_logged) {
                 s_pos_blocked_logged = 1;
                 LOGW("[POS] BLOCKED? err=%dmdeg, no hall edge for %lums (Iqref=%dmA)\n",
-                     (int)(err_now * 1000.0f), (unsigned long)(since_edge / 20U),
+                     (int)(err_now * 1000.0f), (unsigned long)(since_edge / FOC_TICKS_PER_MS),
                      (int)(foc->current_loop.iq_ref * 1000.0f));
             }
         } else {
@@ -1684,11 +1811,16 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
     {
         static uint8_t s_law_div = 0U;
         if (++s_law_div < (uint8_t)POS_LAW_DIV) {
+            FOC_ProfAcc(DWT->CYCCNT - s_pre_t0,
+                        &s_pre_cyc_sum, &s_pre_cyc_max, &s_pre_cyc_cnt);
             FOC_UpdateCurrent(foc);      /* 本拍: 只更新角度 + 电流环(20kHz) */
             return;
         }
         s_law_div = 0U;
         dt_s *= (float)POS_LAW_DIV;      /* 外层律的真实步长 = N 拍 */
+        s_law_t0 = DWT->CYCCNT;          /* ★ 位置律开始计时 */
+        FOC_ProfAcc(s_law_t0 - s_pre_t0,
+                    &s_pre_cyc_sum, &s_pre_cyc_max, &s_pre_cyc_cnt);
     }
 #endif
 
@@ -1752,8 +1884,8 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         if (s_tm_active) {
             float t, Tm, ta, tc, td, tapp;
             if (s_tm_t0 == 0U) s_tm_t0 = foc->tick;
-            t  = (float)(foc->tick - s_tm_t0) / 20000.0f;
-            Tm = (float)s_tm_Ttick / 20000.0f;
+            t  = (float)(foc->tick - s_tm_t0) / (float)FOC_CTRL_HZ;
+            Tm = (float)s_tm_Ttick / (float)FOC_CTRL_HZ;
             ta   = Tm * POS_TM_TA_FRAC;
             tc   = Tm * POS_TM_TC_FRAC;
             td   = Tm * POS_TM_TD_FRAC;
@@ -1968,8 +2100,8 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                    ⚠ 这里只改 v_tgt(及其后级限流/电流环), 不动后面的近目标
                    逻辑 —— 轨迹走完(t>=T)自动交回普通逻辑收尾。 */
                 if (s_tm_active) {
-                    float t   = (float)(foc->tick - s_tm_t0) / 20000.0f;
-                    float Tm  = (float)s_tm_Ttick / 20000.0f;
+                    float t   = (float)(foc->tick - s_tm_t0) / (float)FOC_CTRL_HZ;
+                    float Tm  = (float)s_tm_Ttick / (float)FOC_CTRL_HZ;
                     float ta  = Tm * POS_TM_TA_FRAC;
                     float tc  = Tm * POS_TM_TC_FRAC;
                     float td  = Tm * POS_TM_TD_FRAC;
@@ -2051,38 +2183,19 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         } else if ((t > Tm) && (fabsf(verr) > 1.0f)) {
                             hw   = 2U;                            /* ③ 收尾掉队 */
                             v_ff = (verr >= 0.0f) ? 50.0f : -50.0f;
-                        } else if ((s_pos_move == 0U) &&
-                                   (fabsf(verr) > POS_TM_STALL_DEG)) {
-                            /* ★★★ cal32: ③ **运动中卡在齿槽里** —— 转子确实没动
-                               (s_pos_move==0) 而轨迹参考已跑出去 8° 以上 ⇒
-                               把前馈钉在静摩擦 1.45A 立即破黏。 */
-                            hw   = 3U;
-                            v_ff = (verr >= 0.0f) ? 50.0f : -50.0f;
                         }
                         vmag = fabsf(v_ff);
                         /* hw ≠ 0 ⇒ expf(0)=1 ⇒ fric = POS_TM_FRIC_STATIC_A (1.45A) */
                         float vmag_fric = (hw != 0U) ? 0.0f : vmag;
-                        /* ① 摩擦前馈: 速度相关(Stribeck) + 符号软过渡
-                           ★ cal31: 把起步破黏从 `vmag > 0.01f` 的门里放出来。
-                           4 段轨迹的加速段是升余弦, 起步第一拍 v_eff = 0,
-                           于是 vmag = 0 < 0.01 ⇒ 整块 fric 被跳过 ⇒ 而 hw=1(起步
-                           破黏)的本意正是“起步瞬间就给 1.45A” ⇒ 破黏前馈从来
-                           没有真的给出来过。现在 `vmag > 0.01f || hw != 0U` ⇒ 起步
-                           窗口内即使规划速度为 0 也把 fric 算出来; 符号在 vmag≈0
-                           时取 s_tm_sgn(轨迹方向)。 */
-                        if ((vmag > 0.01f) || (hw != 0U)) {
+                        /* ① 摩擦前馈: 速度相关(Stribeck) + 符号软过渡 */
+                        if (vmag > 0.01f) {
                             float fric = POS_TM_FRIC_SLIDE_A
                                        + (POS_TM_FRIC_STATIC_A - POS_TM_FRIC_SLIDE_A)
                                          * TM_ExpNeg(vmag_fric);
-                            float s;
-                            if (vmag > 0.01f) {
-                                s = v_ff / POS_TM_FF_SIGN_DEG_S;
-                                if (s >  1.0f) s =  1.0f;
-                                if (s < -1.0f) s = -1.0f;
-                                if (vmag < POS_TM_FF_VMIN) s *= (vmag / POS_TM_FF_VMIN);
-                            } else {
-                                s = (float)s_tm_sgn;   /* 起步瞬间 v_eff=0 */
-                            }
+                            float s = v_ff / POS_TM_FF_SIGN_DEG_S;
+                            if (s >  1.0f) s =  1.0f;
+                            if (s < -1.0f) s = -1.0f;
+                            if (vmag < POS_TM_FF_VMIN) s *= (vmag / POS_TM_FF_VMIN);
                             iq_f = s * fric;
                         }
                         /* ② 位置微调(弹簧): 有权限驱动也**有权限刹车** */
@@ -2316,7 +2429,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                                     LOGW("[POS] CREEP give up: %u x push at err=%dmdeg with NO hall edge (even %dmA) -> quiet %ums, then retry.\r\n",
                                          (unsigned)POS_HOP_MAX, (int)(err * 1000.0f),
                                          (int)(POS_SOFT_IQ_MAX_A * 1000.0f),
-                                         (unsigned)(POS_SOFT_GIVE_RETRY_TICKS / 20U));
+                                         (unsigned)(POS_SOFT_GIVE_RETRY_TICKS / FOC_TICKS_PER_MS));
                                 }
                             }
                         }
@@ -2439,10 +2552,10 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                             LOGW("[POS] BLOCKED: %u kicks x %dmA produced NO hall edge (err=%dmdeg, since_edge=%lums).\r\n",
                                  (unsigned)s_pos_kick_fail, (int)(POS_KICK_A * 1000.0f),
                                  (int)(err * 1000.0f),
-                                 (unsigned long)(since_edge / 20U));
+                                 (unsigned long)(since_edge / FOC_TICKS_PER_MS));
                             LOGW("[POS] -> torque is not reaching the rotor (mechanism jammed/loaded, or commutation angle wrong).\r\n");
                             LOGW("[POS] -> hold %us then retry automatically (or press a digit key / 'r').\r\n",
-                                 (unsigned)(POS_BLOCK_RETRY_TICKS / 20000U));
+                                 (unsigned)(POS_BLOCK_RETRY_TICKS / FOC_TICKS_PER_S));
                         }
                     } else {
                         s_pos_kick_end_tick  = foc->tick + POS_KICK_TICKS;
@@ -2458,8 +2571,8 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                                               * (float)foc->torque_dir * POS_FF_DUTY_PER_A);
                         LOGW("[POS] STICTION kick #%u: %dmA for %ums (err=%dmdeg, stalled %lums)\r\n",
                              (unsigned)s_pos_kick_cnt, (int)(POS_KICK_A * 1000.0f),
-                             (unsigned)(POS_KICK_TICKS / 20U),
-                             (int)(err * 1000.0f), (unsigned long)(since_edge / 20U));
+                             (unsigned)(POS_KICK_TICKS / FOC_TICKS_PER_MS),
+                             (int)(err * 1000.0f), (unsigned long)(since_edge / FOC_TICKS_PER_MS));
                     }
                 }
 
@@ -2575,6 +2688,14 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
     foc->current_loop.id_ref = 0.0f;
     foc->current_loop.iq_ref = iq_target;
 
+    /* ★ 位置律计时结束(不含 FOC_UpdateCurrent) */
+    {
+        uint32_t cyc = DWT->CYCCNT - s_law_t0;
+        s_law_cyc_sum += cyc;
+        s_law_cyc_cnt++;
+        if (cyc > s_law_cyc_max) { s_law_cyc_max = cyc; }
+    }
+
     /* ???? */
     FOC_UpdateCurrent(foc);
 }
@@ -2626,7 +2747,7 @@ static void FOC_DoManual(FOC_Control_t *foc, float i_amp)
     /* 软限流 */
     if (i_amp > OL_MAN_ILIM) {
         foc->ol_man_v *= 0.8f;
-        if (foc->tick - foc->ol_last_warn > 4000U) {   /* 200ms 最多一条 */
+        if (foc->tick - foc->ol_last_warn > (200U * FOC_TICKS_PER_MS)) {   /* 200ms 最多一条 */
             foc->ol_last_warn = foc->tick;
             LOGW("[MAN] |I|=%.2fA > %.1fA -> v down to %.4f\n",
                  i_amp, OL_MAN_ILIM, foc->ol_man_v);
@@ -2636,7 +2757,7 @@ static void FOC_DoManual(FOC_Control_t *foc, float i_amp)
     /* 硬保护: 持续大电流 → 关 PWM。即使 v=0 也会触发(下管击穿时的回流路径)。 */
     if (i_amp > OL_MAN_TRIP_A) {
         s_man_oc_cnt++;
-        if (s_man_oc_cnt > (OL_MAN_TRIP_MS * 20U)) {
+        if (s_man_oc_cnt > (OL_MAN_TRIP_MS * FOC_TICKS_PER_MS)) {
             s_man_oc_cnt = 0U;
             foc->ol_man_v = 0.0f;
             LOGW("[MAN] !! %0.2fA for %ums -> PWM OFF. HW FAULT? check W-phase FET/shunt. press u to re-arm\n",
@@ -3062,7 +3183,7 @@ static void FOC_UpdateAngle(FOC_Control_t *foc, float *erpm_out)
                                               &foc->hall,
                                               foc->tick,
                                               foc->config.pwm_freq,
-                                              20000U,
+                                              FOC_TICKS_PER_S,
                                               1.0f,
                                               1,
                                               &erpm);
@@ -3070,10 +3191,71 @@ static void FOC_UpdateAngle(FOC_Control_t *foc, float *erpm_out)
 }
 
 /* ---- ????? + SVPWM?? ---- */
+/* ---- ★ 2026-10-24 到位静音判定(见 PWM_IDLE_OFF_* 的说明) ----
+   返回 1 = 当前处于"已关断"。
+   抽成函数的两个目的:
+     ① 关断期间可以**整段跳过** Clarke/Park/PI/逆Park/SVPWM —— PWM 已经关了,
+        没有电流可调, 那 8.3us 全是白花的; 重新使能时会 CurrentLoop_ResetInteg
+        清积分, 不会残留旧积分。
+     ② 日志改成"只置事件标志", 由主循环打印 —— 实测在中断里 LOGD
+        (vsnprintf + RTT 写入) 会把那一拍从 8.3us 拉到 17us。 */
+static uint8_t FOC_PwmIdleEval(FOC_Control_t *foc)
+{
+    uint8_t want_off = 0U;
+    float   aerr     = fabsf(foc->position_loop.pos_err_deg);
+    /* 滞环: 已关断时用更宽的门才能退出, 防止在门限附近 off/on 反复 */
+    float   elim     = (s_pwm_idle_off != 0U) ? PWM_IDLE_OFF_EXIT_DEG
+                                              : PWM_IDLE_OFF_DEG;
+
+    if ((s_pwm_idle_en != 0U) &&
+        (foc->state == FOC_STATE_POSITION_LOOP) &&
+        (foc->position_loop.arrived != 0U) &&
+        (s_tm_active == 0U) &&
+        (fabsf(foc->current_loop.iq_ref) < PWM_IDLE_OFF_CUR_A) &&
+        (aerr < elim)) {
+        if (s_pwm_idle_tick == 0U) {
+            s_pwm_idle_tick = foc->tick;
+        } else if ((foc->tick - s_pwm_idle_tick) >= PWM_IDLE_OFF_ARM_TICKS) {
+            want_off = 1U;
+        }
+    } else {
+        s_pwm_idle_tick = 0U;
+    }
+
+    if ((want_off != 0U) && (s_pwm_idle_off == 0U)) {
+        s_pwm_idle_off = 1U;
+        PWM_Output_Disable();
+        s_pwm_on = 0U;      /* 关断期间采样无意义 ⇒ 不参与过流判断 */
+        s_pwm_evt     = 1U; /* 交给主循环打印 */
+        s_pwm_evt_pos = (int32_t)(foc->position_loop.pos_now_deg * 1000.0f);
+        s_pwm_evt_err = 0;
+    } else if ((want_off == 0U) && (s_pwm_idle_off != 0U)) {
+        s_pwm_idle_off = 0U;
+        CurrentLoop_ResetInteg(&foc->current_loop);
+        s_pwm_evt     = 2U;
+        s_pwm_evt_pos = (int32_t)(foc->position_loop.pos_now_deg * 1000.0f);
+        s_pwm_evt_err = (int32_t)(foc->position_loop.pos_err_deg * 1000.0f);
+    }
+    return s_pwm_idle_off;
+}
+
 static void FOC_UpdateCurrent(FOC_Control_t *foc)
 {
     float ialpha, ibeta, id, iq;
     float valpha, vbeta;
+    uint32_t pt0 = DWT->CYCCNT;   /* ★ 拆分计时的 CUR 段起点 */
+
+    /* ★★ 已关断 ⇒ 只做"要不要重新打开"的滞环判定, 电流环整段跳过。
+       实测: 到位保持时(po=1) CUR 从 8.34us 降到 ~0.3us,
+             整拍从 21.3us 降到 ~13us, 中断负载 43% → ~26%。 */
+    if (s_pwm_idle_off != 0U) {
+        (void)FOC_PwmIdleEval(foc);
+        if (s_pwm_idle_off != 0U) {
+            FOC_ProfAcc(DWT->CYCCNT - pt0,
+                        &s_cur_cyc_sum, &s_cur_cyc_max, &s_cur_cyc_cnt);
+            return;
+        }
+    }
 
     /* Clarke?? */
     Clarke_Transform(foc->current.u, foc->current.v, foc->current.w,
@@ -3094,7 +3276,9 @@ static void FOC_UpdateCurrent(FOC_Control_t *foc)
            不让它变成真的 9.5A。 */
         if (!(iq_cmd >= -8.0f && iq_cmd <= 8.0f)) iq_cmd = 0.0f;
         foc->current_loop.iq_ref = iq_cmd;
-        CurrentLoop_Update(&foc->current_loop, id, iq, 1.0f / foc->config.pwm_freq);
+        /* ★ 2026-10-24: dt_s = 1/f 是常量, 原来每拍要除一次 */
+        if (s_cur_dt_s <= 0.0f) { s_cur_dt_s = 1.0f / foc->config.pwm_freq; }
+        CurrentLoop_Update(&foc->current_loop, id, iq, s_cur_dt_s);
         foc->current_loop.iq_ref = saved;
     }
 
@@ -3107,9 +3291,20 @@ static void FOC_UpdateCurrent(FOC_Control_t *foc)
     /* SVPWM?? */
     PWM_Output_SVPWM(&foc->pwm, valpha, vbeta,
                      foc->current.u, foc->current.v, foc->current.w);
+
+    /* ---- ★ 2026-10-24 到位静音判定(见 PWM_IDLE_OFF_* / FOC_PwmIdleEval) ---- */
+    if (FOC_PwmIdleEval(foc) != 0U) {
+        FOC_ProfAcc(DWT->CYCCNT - pt0,
+                    &s_cur_cyc_sum, &s_cur_cyc_max, &s_cur_cyc_cnt);
+        return;                 /* 关断中: 不再下发占空比, 也不置 s_pwm_on */
+    }
+
     PWM_Output_Apply(&foc->pwm);
     if (!s_pwm_on) s_pwm_on_tick = foc->tick;   /* 记录开通时刻, 用于过流消隐 */
     s_pwm_on = 1;   /* 三相输出已使能, 之后的采样才有效, 可做过流判断 */
+
+    FOC_ProfAcc(DWT->CYCCNT - pt0,
+                &s_cur_cyc_sum, &s_cur_cyc_max, &s_cur_cyc_cnt);
 }
 
 /* ---- ???? ---- */
@@ -3222,7 +3417,7 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
         T = dur_s;
     }
     s_tm_t0     = 0U;        /* 0 = 还没起步(第一拍位置环里锚定时间轴) */
-    s_tm_Ttick  = (uint32_t)(T * 20000.0f + 0.5f);
+    s_tm_Ttick  = (uint32_t)(T * (float)FOC_CTRL_HZ + 0.5f);
     s_tm_deg0   = pos0;
     s_tm_sgn    = (dist >= 0.0f) ? 1 : -1;
     /* ★ 2026-10-11an 4 段: 加速 2/9 + 匀速 3/9 + 减速 2/9 + 逼近 2/9。
@@ -3370,7 +3565,7 @@ void FOC_Control_SetTorqueProbe(FOC_Control_t *foc, float iq_A, uint32_t dur_ms)
         LOGD("[PROBE] ignored: state not POSITION_LOOP (%d)\n", (int)foc->state);
         return;
     }
-    uint32_t n = dur_ms * 20U;   /* 20kHz */
+    uint32_t n = dur_ms * FOC_TICKS_PER_MS;   /* 控制拍 */
     if (n == 0U) n = 1U;
     foc->probe_iq_A  = iq_A;
     foc->probe_total = n;

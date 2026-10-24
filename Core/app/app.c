@@ -34,7 +34,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-18 cal32 stall-ff short-dur"
+#define FW_BUILD_TAG  "2026-10-24 cal30 20k lean"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U
@@ -448,6 +448,13 @@ static void App_HandleKey(int ch)
         FOC_Control_SetTimedTarget(&g_foc, 0.0f, FOC_POS_DEFAULT_TM_S);
         LOGD("[CMD] Zero position\n");
         AutoStartIfIdle();
+    } else if (ch == 'A') {
+        /* ★ 2026-10-24 到位静音(PWM 关断)开关 —— 用来判定静止啸叫是不是
+           PWM 载波引起的。只认大写 'A', 避免 RTT 乱码里的小写 a 误触发
+           (与 'D' 的教训一致)。 */
+        FOC_Control_SetPwmIdleOff(FOC_Control_GetPwmIdleOff() ? 0U : 1U);
+        LOGD("[CMD] PWM idle-off %s (silent hold at target)\r\n",
+             FOC_Control_GetPwmIdleOff() ? "ON" : "OFF");
     } else if (ch == 'j' || ch == 'J') {
         FOC_Control_SetTorqueProbe(&g_foc, +2.5f, 600);   /* +Iq 探针 */
     } else if (ch == 'k' || ch == 'K') {
@@ -477,10 +484,7 @@ static void App_HandleKey(int ch)
            不是参数能解决的(要根治只能加齿槽补偿表或换磁编码器)。 */
         {
             float dur = fabsf(de) / 360.0f;
-            /* ★ cal32: 下限 0.35 → 0.20s。45° 在 0.35s 档下 v_cruise 只有
-               250°/s(低于齿槽惯性穿越 384°/s) ⇒ 每个齿槽都要硬踢一脚。
-               0.20s 把 45° 的巡航抬到 ~292°/s, 配合 hw=3 破黏。 */
-            if (dur < 0.20f) dur = 0.20f;
+            if (dur < 0.35f) dur = 0.35f;
             if (dur > FOC_POS_DEFAULT_TM_S) dur = FOC_POS_DEFAULT_TM_S;
             FOC_Control_SetTimedTarget(&g_foc, target, dur);
         }
@@ -609,7 +613,7 @@ static void App_ReportMain(uint32_t now)
 
         s_last_main_ms = now;
         FOC_Control_GetTrajDiag(&td_verr, &td_ff, &td_trim, &td_vobs);
-        LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f | mv=%d jp=%u vs=%.0f | hl=%d gv=%d bh=%d cr=%u tm=%u sl=%u | tv=%.1f ff=%.2f tr=%.2f vob=%.0f\r\n",
+        LOGD("[MAIN] t=%lums st=%d flt=%d fc=0x%04X h=%d arr=%d Pos=%.2f Tgt=%.2f err=%.2f th=%.1f Id=%.2f Iq=%.2f Iqref=%.2f vd=%.3f vq=%.3f du=%.3f spd=%.0f fb=%.0f Ipos=%.2f vsp=%.0f | ob=%.0f vp=%.0f adv=%.2f dte=%.0f | mv=%d jp=%u vs=%.0f | hl=%d gv=%d bh=%d cr=%u tm=%u sl=%u | tv=%.1f ff=%.2f tr=%.2f vob=%.0f po=%d\r\n",
              (unsigned long)now,
              g_foc.state, g_foc.flags.fault, (unsigned)g_foc.fault_code,
              (int)g_foc.hall.state,
@@ -640,7 +644,8 @@ static void App_ReportMain(uint32_t now)
              (unsigned)FOC_Control_GetPosHopCnt(),
              (unsigned)FOC_Control_GetTimedPhase(),
              (unsigned)FOC_Control_GetPosSettleFlag(),
-             td_verr, td_ff, td_trim, td_vobs);
+             td_verr, td_ff, td_trim, td_vobs,
+             (int)FOC_Control_GetPwmIdleOffActive());
     }
 
     /* ---- [ANG] 10ms(INFO 级, 默认不打印; 要看把 log.h 的等级调到 INFO) ---- */
@@ -678,10 +683,14 @@ void App_OnCurrentSample(void)
     BSP_ADC_GetCurrentRaw(&ru, &rv, &rw);
 
     if (s_off_ok) {
-        float iu = CFG_CURRENT_SIGN * ((float)ru - (float)s_off_u)
-                   * vref / (res - 1.0f) / scale;
-        float iv = CFG_CURRENT_SIGN * ((float)rv - (float)s_off_v)
-                   * vref / (res - 1.0f) / scale;
+        /* ★ 2026-10-24: 把 vref/((res-1)*scale)*sign 折成一个常数。
+           原来每相要除两次(3 相 × 2 = 6 次 VDIV ≈ 0.5us/拍), 现在只乘一次。 */
+        static float s_i_k = 0.0f;
+        if (s_i_k == 0.0f) {
+            s_i_k = CFG_CURRENT_SIGN * vref / ((res - 1.0f) * scale);
+        }
+        float iu = ((float)ru - (float)s_off_u) * s_i_k;
+        float iv = ((float)rv - (float)s_off_v) * s_i_k;
         g_foc.current.u = iu;
         g_foc.current.v = iv;
         g_foc.current.w = -(iu + iv);
@@ -729,7 +738,7 @@ static void App_PrintKeys(void)
     LOGD("[MAIN] Keys: t<deg> d<sec> + Enter = TIMED move (accel/cruise/decel/creep = 2/9,3/9,2/9,2/9)\r\n");
     LOGD("[MAIN] Keys: 0~9/z default timed move: any angle in %.1fs (ramp-to-zero)\r\n",
          (double)FOC_POS_DEFAULT_TM_S);
-    LOGD("[MAIN] Keys: v=verbose log(25ms)  w=VOFA wave on/off\r\n");
+    LOGD("[MAIN] Keys: v=verbose log(25ms)  w=VOFA wave on/off  A=PWM idle-off @target\r\n");
     LOGD("[ANG] idx,state,hall,synced,elec_deg,mech_deg,erpm\r\n");
 }
 
@@ -837,9 +846,31 @@ static void App_ReportProf(uint32_t now)
         uint32_t rtt_drop = rtt_now - s_pf_drop;   /* 本窗口(1s)丢掉的行数 */
         s_pf_drop = rtt_now;
 
+        /* ★ 2026-10-24: 一拍三段拆分计时(DWT), 用来定位最坏一拍的归属
+           ⚠ 上次只计 LAW, 但打印时实参顺序写成 idle→LAW, 而格式串是 LAW→idle
+             ⇒ 整段数字错位(日志里出现 avg=5.10002us 这种)。此处一并纠正。 */
+        FOC_SplitProf_t sp;
+        sp.pre_avg = 0U; sp.pre_max = 0U; sp.pre_n = 0U;
+        sp.ang_avg = 0U; sp.ang_max = 0U; sp.ang_n = 0U;
+        sp.law_avg = 0U; sp.law_max = 0U; sp.law_n = 0U;
+        sp.cur_avg = 0U; sp.cur_max = 0U; sp.cur_n = 0U;
+        FOC_Control_TakeSplitProf(&sp);
+        uint32_t pre_avg = App_CycToUsX100(sp.pre_avg);
+        uint32_t pre_max = App_CycToUsX100(sp.pre_max);
+        uint32_t ang_avg = App_CycToUsX100(sp.ang_avg);
+        uint32_t ang_max = App_CycToUsX100(sp.ang_max);
+        uint32_t law_avg = App_CycToUsX100(sp.law_avg);
+        uint32_t law_max = App_CycToUsX100(sp.law_max);
+        uint32_t cur_avg = App_CycToUsX100(sp.cur_avg);
+        uint32_t cur_max = App_CycToUsX100(sp.cur_max);
+
         LOGD("[PROF] win=%lums | FOC@20k n=%lu load=%lu.%02lu%% tot=%lums avg=%lu.%02luus max=%lu.%02luus"
              " | VOFA@1k n=%lu load=%lu.%02lu%% tot=%lums avg=%lu.%02luus max=%lu.%02luus"
-             " | idle=%lu.%02lu%% | rtt a=%lu f=%lu m=%lu drop=%lu\r\n",
+             " | ANG n=%lu avg=%lu.%02luus max=%lu.%02luus"
+             " | PRE n=%lu avg=%lu.%02luus max=%lu.%02luus"
+             " | LAW n=%lu avg=%lu.%02luus max=%lu.%02luus"
+             " | CUR n=%lu avg=%lu.%02luus max=%lu.%02luus"
+             " | idle=%lu.%02lu%% | rttdrop=%lu\r\n",
              (unsigned long)(p.win_cycles / clk1000),
              (unsigned long)p.isr_count,
              (unsigned long)(isr_pm / 100U), (unsigned long)(isr_pm % 100U),
@@ -855,11 +886,37 @@ static void App_ReportProf(uint32_t now)
              (unsigned long)(App_CycToUsX100(wav_avg) % 100U),
              (unsigned long)(App_CycToUsX100(p.wav_max) / 100U),
              (unsigned long)(App_CycToUsX100(p.wav_max) % 100U),
+             (unsigned long)sp.ang_n,
+             (unsigned long)(ang_avg / 100U), (unsigned long)(ang_avg % 100U),
+             (unsigned long)(ang_max / 100U), (unsigned long)(ang_max % 100U),
+             (unsigned long)sp.pre_n,
+             (unsigned long)(pre_avg / 100U), (unsigned long)(pre_avg % 100U),
+             (unsigned long)(pre_max / 100U), (unsigned long)(pre_max % 100U),
+             (unsigned long)sp.law_n,
+             (unsigned long)(law_avg / 100U), (unsigned long)(law_avg % 100U),
+             (unsigned long)(law_max / 100U), (unsigned long)(law_max % 100U),
+             (unsigned long)sp.cur_n,
+             (unsigned long)(cur_avg / 100U), (unsigned long)(cur_avg % 100U),
+             (unsigned long)(cur_max / 100U), (unsigned long)(cur_max % 100U),
              (unsigned long)(idl_pm / 100U), (unsigned long)(idl_pm % 100U),
-             (unsigned long)BSP_Log_GetRttAvailMin(),
-             (unsigned long)BSP_Log_GetRttForce(),
-             (unsigned long)BSP_Log_GetRttMaxLen(),
              (unsigned long)rtt_drop);
+    }
+}
+
+/* ★ 2026-10-24: 到位静音(PWM 关断/使能)事件改成主循环打印。
+   原来这两条 LOGD 是在 20kHz 中断里调的, 走 vsnprintf + RTT 写入,
+   实测会把那一拍的 CUR 从 8.3us 拉到 17us —— [PROF] 的 max 因此虚高。 */
+static void App_PollPwmEvent(void)
+{
+    int32_t pos_mdeg = 0;
+    int32_t err_mdeg = 0;
+    uint8_t ev = FOC_Control_TakePwmEvent(&pos_mdeg, &err_mdeg);
+
+    if (ev == 1U) {
+        LOGD("[PWM] idle-off @Pos=%ldmdeg (silent hold)\r\n", (long)pos_mdeg);
+    } else if (ev == 2U) {
+        LOGD("[PWM] idle-on  @Pos=%ldmdeg err=%ldmdeg\r\n",
+             (long)pos_mdeg, (long)err_mdeg);
     }
 }
 
@@ -868,6 +925,7 @@ void App_Loop(void)
     uint32_t now = BSP_Time_Ms();
 
     App_PollKeys();
+    App_PollPwmEvent();        /* ★ 2026-10-24: PWM 关断/使能事件改到主循环打印 */
     BSP_Log_DeferFlush();      /* ★ cal25: 把中断里攒下的日志一次性写出 */
     App_ReportSlow(now);
 

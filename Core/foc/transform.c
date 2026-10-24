@@ -23,6 +23,12 @@
 static float   s_tbl[TBL_N + 1];   /* 最后多一格给线性插值 */
 static uint8_t s_tbl_ok = 0U;
 
+/* ★ 2026-10-24: 同一角度的 sin/cos 复用缓存(Park 与 InvPark 共用) */
+static uint8_t s_lc_ok = 0U;
+static float   s_lc_th = 0.0f;
+static float   s_lc_s  = 0.0f;
+static float   s_lc_c  = 0.0f;
+
 void FOC_Math_Init(void)
 {
     int32_t i;
@@ -40,6 +46,15 @@ void FOC_SinCos(float th, float *s, float *c)
 
     if (s_tbl_ok == 0U) { FOC_Math_Init(); }   /* 兜底: 忘了初始化也不会算错 */
 
+    /* ★ 2026-10-24 性能: Park_Transform 与 InvPark_Transform 每拍用的是**同一个
+       theta**, 原来要算两遍查表+插值。这里把上一次的结果缓存一拍。
+       (正确性: 完全由入参决定, 命中与否结果一致) */
+    if ((s_lc_ok != 0U) && (th == s_lc_th)) {
+        if (s != 0) { *s = s_lc_s; }
+        if (c != 0) { *c = s_lc_c; }
+        return;
+    }
+
     x = th * TBL_K;
     if (x >  1.0e6f) { x = 0.0f; }             /* 防 NaN/Inf 把 int 转换搞爆 */
     if (x < -1.0e6f) { x = 0.0f; }
@@ -49,11 +64,13 @@ void FOC_SinCos(float th, float *s, float *c)
     j = (i + (TBL_N / 4)) & TBL_MASK;          /* cos = sin(θ+90°) */
 
     a0 = s_tbl[i]; a1 = s_tbl[i + 1];
-    if (s != 0) { *s = a0 + f * (a1 - a0); }
-    if (c != 0) {
-        b0 = s_tbl[j]; b1 = s_tbl[j + 1];
-        *c = b0 + f * (b1 - b0);
-    }
+    b0 = s_tbl[j]; b1 = s_tbl[j + 1];
+    s_lc_th = th;
+    s_lc_s  = a0 + f * (a1 - a0);
+    s_lc_c  = b0 + f * (b1 - b0);
+    s_lc_ok = 1U;
+    if (s != 0) { *s = s_lc_s; }
+    if (c != 0) { *c = s_lc_c; }
 }
 
 float FOC_Sin(float th)

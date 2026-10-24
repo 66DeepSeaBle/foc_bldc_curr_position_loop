@@ -168,6 +168,33 @@ uint8_t  FOC_Control_GetPosBlockFlag(void); /* 1 = 机构推不动 */
 uint8_t  FOC_Control_GetPosSettleFlag(void);/* 1 = 近目标松手静默中 */
 uint16_t FOC_Control_GetPosHopCnt(void);    /* 本轮连续推不动次数 */
 
+/* ---- ★ 2026-10-24 到位静音(PWM 关断) ----
+   到位且零电流持续 150ms 后关断三相输出, 用来判定静止啸叫是否来自 PWM 载波。
+   en=0 即完全回到原行为。运行期用大写 'A' 切换。 */
+void     FOC_Control_SetPwmIdleOff(uint8_t en);
+uint8_t  FOC_Control_GetPwmIdleOff(void);       /* 1 = 功能开启 */
+uint8_t  FOC_Control_GetPwmIdleOffActive(void); /* 1 = 当前已关断 */
+
+/* ---- ★ 2026-10-24 一拍拆分计时(DWT 周期数) ----
+   目的: 把 20kHz 中断里最坏那一拍(实测 41~43us)拆成三块, 再决定削谁。
+     PRE = 进 FOC_DoPositionLoop → 分频门  (角度更新/动-静判定/看门狗)
+     LAW = 分频门 → 外层位置律结束        (轨迹/前馈/爬行/破黏/冻结)
+     CUR = FOC_UpdateCurrent 全程          (Clarke/Park/PI/逆Park/SVPWM/下发)
+   三者之和 = 位置环那一段; 与 [PROF] 的 avg/max 相减即 ISR 固定开销。
+   ⚠ 读即清零。统计量不参与控制。 */
+typedef struct {
+    uint32_t pre_avg, pre_max, pre_n;
+    uint32_t ang_avg, ang_max, ang_n;   /* PRE 里的角度更新子项 */
+    uint32_t law_avg, law_max, law_n;
+    uint32_t cur_avg, cur_max, cur_n;
+} FOC_SplitProf_t;
+
+void     FOC_Control_TakeSplitProf(FOC_SplitProf_t *out);
+
+/* ★ 2026-10-24: 取走到位静音事件(读即清)。返回 0=无 1=idle-off 2=idle-on。
+   中断里不再直接打日志, 改由主循环调本函数打印。 */
+uint8_t  FOC_Control_TakePwmEvent(int32_t *pos_mdeg, int32_t *err_mdeg);
+
 #ifdef __cplusplus
 }
 #endif
