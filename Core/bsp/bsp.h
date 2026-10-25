@@ -103,5 +103,6 @@ void     BSP_Log_DeferFlush(void);   /* 主循环里每圈调一次 */
    0 = RTT 缓冲从不丢数据 ⇒ 无需再加 BUFFER_SIZE_UP。
    非 0 = 主机侧读得太慢(或 RTT Viewer 暂停/断连), 再加容量才有意义。 */
 uint32_t BSP_Log_GetRttDrop(void);
+uint32_t BSP_Log_GetRttBad(void);    /* ★ 2026-10-25: 被判为乱码而丢弃的行数 */
 
 #endif /* __BSP_H__ */

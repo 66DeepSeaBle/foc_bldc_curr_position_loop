@@ -308,6 +308,7 @@ static volatile uint8_t  s_logq_busy = 0U;
 static char              s_rtt_line[RTT_LINE_MAX];
 static unsigned          s_rtt_line_len = 0U;
 static volatile uint32_t s_rtt_drop     = 0U;   /* 被 SKIP 掉的**行**数 */
+static volatile uint32_t s_rtt_bad      = 0U;   /* ★ 2026-10-25 A2e: 乱码行(被丢弃)数 */
 
 /* ---- 极简整数格式化(★ cal27, 只给中断路径用) ----------------------------
    cal26 发现: 把中断日志的 %.1f 换成 %dmA 之后 max 还是 108us —— 说明贵的不
@@ -485,6 +486,12 @@ uint32_t BSP_Log_GetRttDrop(void)
     return s_rtt_drop;
 }
 
+/* ★ 2026-10-25 A2e: 被判定为“乱码”而丢弃的行数(见 fputc 里的扫描) */
+uint32_t BSP_Log_GetRttBad(void)
+{
+    return s_rtt_bad;
+}
+
 /* ==========================================================================
  * ★★★ cal29: fputc 改成“整行缓冲” —— 一行日志 = 一次 RTT 写入
  * --------------------------------------------------------------------------
@@ -524,11 +531,36 @@ int fputc(int ch, FILE *f)
     }
 
     if ((s_rtt_line_len >= (RTT_LINE_MAX - 1U)) || (ch == '\n')) {
-        unsigned len;
+        unsigned len, i;
+        uint8_t  bad = 0U;
 
         s_rtt_line[s_rtt_line_len++] = (char)ch;
         len = s_rtt_line_len;
-        if (SEGGER_RTT_Write(0, s_rtt_line, len) != len) {
+
+        /* ★★ 2026-10-25 A2e: 整行健全性检查。
+           日志里偶发出现 "€E33S@ / 33S@$" 这种乱码片段(两份日志各有 1~2 处)，
+           而 `rttdrop` 始终为 0 ⇒ **不是整行被 SKIP**，而是行缓冲 s_rtt_line
+           在写出前内容就被改掉了，或者根本是上位机(RTT Viewer)的显示问题。
+           我们的日志全部是可打印 ASCII + \r\n\t，出现其它字节就判定为坏行：
+             · 整行丢弃(宁可再生一行，不把乱码送给上位机)
+             · 计数进 s_rtt_bad，并在 [PROF] 里打出 rttbad=N
+           判读：
+             · rttbad 跟着乱码一起涨  ⇒ 目标端内存/缓冲被踩（继续查）
+             · rttbad 一直为 0 但仍有乱码 ⇒ 问题在上位机 / J-Link，与固件无关
+           代价: 每行一次 ~300 字节扫描，100ms 一次，可以忽略。 */
+        for (i = 0U; i < len; i++) {
+            unsigned char c = (unsigned char)s_rtt_line[i];
+            if ((c >= 0x80U) || (c == 0x7FU) ||
+                ((c < 0x20U) && (c != (unsigned char)'\r') &&
+                 (c != (unsigned char)'\n') && (c != (unsigned char)'\t'))) {
+                bad = 1U;
+                break;
+            }
+        }
+
+        if (bad != 0U) {
+            s_rtt_bad++;                        /* 乱码行: 丢弃 */
+        } else if (SEGGER_RTT_Write(0, s_rtt_line, len) != len) {
             s_rtt_drop++;                       /* 整行被 SKIP */
         }
         s_rtt_line_len = 0U;

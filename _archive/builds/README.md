@@ -1,53 +1,31 @@
-# 路线 B：15 / 16 / 20 kHz 对比固件（2026-10-24）
+# 构建输出目录（2026-10-25 起统一为一个名字）
 
-三个固件**只有频率不同**，其余完全一致：
+## 约定
 
-- 代码基线 = `cal30`（quiet120 / vapp28 / tm085）
-- 均已包含 **idle-off（到位关 PWM）**，默认 **开启**（RAM 里，按 `A` 切换，掉电恢复为开启）
-- 均已包含 **CCR4 比例修正**（ADC 采样时刻 = 98.85% × ARR，三者采样相位统一）
-- `POS_LAW_DIV = 2`
-- 所有 `*_TICKS` 常量已按 `FOC_TICKS_PER_MS` 归一
+Keil 工程 `MDK-ARM/BldcClamp.uvprojx` 的输出固定为：
 
-| 文件 | tag | FOC_CTRL_HZ | TIM1 ARR | CCR4 | 实际频率 | 位置律 | Code | RO | RW | ZI |
-|---|---|---|---|---|---|---|---|---|---|---|
-| `f15k.hex` / `.axf` | `2026-10-24 cal30 15kHz routeB` | 15000 | 5666 | 5600 | 14998.2 Hz | 7.50 kHz | 52588 | 5060 | 380 | 10660 |
-| `f16k.hex` / `.axf` | `2026-10-24 cal30 16kHz routeB` | 16000 | 5311 | 5249 | 16001.5 Hz | 8.00 kHz | 52560 | 5060 | 380 | 10660 |
-| `f20k.hex` / `.axf` | `2026-10-24 cal30 20kHz routeB` | 20000 | 4249 | 4199 | 20000.0 Hz | 10.0 kHz | 52612 | 5060 | 380 | 10660 |
+```xml
+<OutputDirectory>..\_archive\builds\</OutputDirectory>
+<OutputName>BldcClamp</OutputName>
+```
 
-全部 0 Error / 0 Warning。
+⇒ 每次编译**只产出一套** `BldcClamp.*`，不再出现
+`f20k / f15k / A2 / A2b / A2c / A2d / B1_trimslew / BASELINE_A_*` 这种一版一个文件名的漂移。
 
-## 已知的残余变量（无法消除，须知）
+| 产物 | 说明 |
+|---|---|
+| `BldcClamp.hex` | **烧录用**（Keil Flash → Download 也会直接烧这个） |
+| `BldcClamp.axf` | 调试用（J-Link / STM32CubeProgrammer 都认） |
+| `BldcClamp.map` | 内存/符号表 |
+| `BldcClamp.htm` | 静态调用图 |
+| `BldcClamp.build_log.htm` | 编译日志（0 Error / 0 Warning 就看这个） |
+| `*.o` `*.crf` `*.d` `*.lnp` `*.sct` `*.dep` | 中间文件，可随时删除 |
 
-1. **位置律绝对频率不同**：7.5 / 8 / 10 kHz。`POS_LAW_DIV` 只能取整数，15 kHz 想凑 10 kHz 需要 1.5。
-2. **电流纹波 ΔI_pp ∝ 1/f**（物理必然）：15k 1.33× / 16k 1.25× / 20k 1.00×。
-3. 采样点虽然相位统一，但**离开关沿的绝对时间**不同：
-   15k 471 ns / 16k 365 ns / 20k 294 ns（均为峰顶前）。
+> ⚠ **判断烧的是哪一版，看 `[FW] build ...` 那行 tag，不要看文件名。**
+> 文件名永远叫 `BldcClamp`，内容随源码变。
 
-## 烧录
+## 历史快照
 
-任意一种：
-
-- **Keil**：打开 `MDK-ARM/BldcClamp.uvprojx` → `Flash → Download`（会烧当前源码编出的版本，
-  不是这三个 hex）
-- **只想烧指定 hex**：用 STM32CubeProgrammer / J-Flash / J-Link Commander：
-  ```
-  STM32_Programmer_CLI.exe -c port=SWD -w f15k.hex -v -rst
-  ```
-- 用 axf 也可以（J-Link 直接支持 .axf/.elf）
-
-## 测试记录表（每个频率跑 5 次 `0` → `8`）
-
-重点不是单次手感（`tv` 峰单次波动 23°~42°），而是统计量：
-
-| 频率 | 第1次 tv峰 | 第2次 | 第3次 | 第4次 | 第5次 | 中位数 | 主观平滑度(1~5) |
-|---|---|---|---|---|---|---|---|
-| 15 kHz | | | | | | | |
-| 16 kHz | | | | | | | |
-| 20 kHz | | | | | | | |
-
-同时记录（每个频率各一次即可）：
-
-- `[FW] build ...` 行（确认烧的是哪版）
-- `[PROF]` 两行：静止（`po=1`）与运动，看 `n=`、`load`、`max`
-- 到位是否出现 `[PWM] idle-off`、`po=1`
-- `jp=`（读数跳变计数）累计值
+`_archive/snapshots/`（`cal30_15kHz` / `cal30_20kHz` / `cal30_20k_routeB`）
+与旧的 `f15k/f16k/f20k*.hex` 已于 2026-10-25 删除 —— 频率对比实验已结束，定版 20 kHz。
+这些源码快照在 git 里有记录，需要时用 `git log -- _archive/snapshots` 找回。

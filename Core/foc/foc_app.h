@@ -50,7 +50,11 @@ extern "C" {
 #endif
 
 /* ---- 力矩档(A): 位置环允许输出的最大 q 轴电流 ---------------------------- */
-#define FOC_APP_TORQUE_DEF_A     2.50f   /* 默认 = 原 POS_IQ_CAP_A, 行为不变 */
+#define FOC_APP_TORQUE_DEF_A     3.00f   /* 2026-10-25 A2e: 2.50 → 3.00
+                                            （默认值，上电即生效；`[`/`]` 仍可±0.1A）
+                                            理由：2.50 时破黏电流不够，长行程最后一段
+                                            反复“卡 500ms → 滑一格”。3.00 让
+                                            trim/kick 上限同步抬高 20%（r=cap/2.5）。 */
 #define FOC_APP_TORQUE_MIN_A     0.30f
 #define FOC_APP_TORQUE_MAX_A     5.00f   /* 过流 6A 留 1A 余量 */
 

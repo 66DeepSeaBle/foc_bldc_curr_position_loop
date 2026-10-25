@@ -98,7 +98,8 @@ Revision: $Rev: 24316 $
      模式下写满就跳过/截断当前这次写入，表现为RTT终端里大段乱码/正常
      文本中间插入无法识别的二进制片段。加大到4096给调试器更多余量，
      芯片RAM本身用量很小(实测ZI-data仅约3.3KB)，加这点余量完全够用。 */
-  #define BUFFER_SIZE_UP                            (4096)  // Size of the buffer for terminal output of target, up to host (Default: 1k)
+  #define BUFFER_SIZE_UP                            (8192)  // Size of the buffer for terminal output of target, up to host (Default: 1k)
+                                                          // 2026-10-25 A2e: 4096 → 8192，给 J-Link 取数延迟多留余量
 #endif
 
 #ifndef   BUFFER_SIZE_DOWN

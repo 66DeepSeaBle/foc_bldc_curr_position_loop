@@ -35,7 +35,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-25 cal30 20k A2d"
+#define FW_BUILD_TAG  "2026-10-25 cal30 20k A2g"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U
@@ -48,6 +48,20 @@ static FOC_Control_t g_foc;
 /* 相电流零点(ADC 码)与"标定完成"标志 */
 static uint16_t s_off_u = 0U, s_off_v = 0U, s_off_w = 0U;
 static uint8_t  s_off_ok = 0U;
+
+/* ★★ 2026-10-25 A2e: “六路全关”(idle-off)状态下的第二套零点。
+   标定是在 **0% 占空比 = 下管全通** 下做的（BSP_PWM_SetDuty3(0,0,0)）:
+   采样电阻下端接 GND、运放输入共模 ≈0V。
+   而 idle-off 走 BSP_PWM_Off() ⇒ CCxE/CCxNE **全清 = 六路全关**，
+   运放输入共模完全不同 ⇒ 零点整体漂移。实测静止全关时:
+        cntU=2683(cntV=2682 cntW=2618) vs off=2615/2624/2628
+        ⇒ Iu=-0.68 Iv=-0.58 Iw=+1.27, 三相和 =0
+        ⇒ Park 后是个 **0.63A 的假矢量**(日志 Id=0.52 Iq=-0.36)
+   全关断时电机里确实没有电流，所以可以放心把这一套零点跟踪到当前读数。
+   注意：**只有在 po=1 时用它**。PWM 重新使能后必须立即切回 s_off_*，
+   否则驱动态零点就变成“全关”的了。 */
+static uint16_t s_offo_u = 0U, s_offo_v = 0U, s_offo_w = 0U;
+static int32_t  s_ofq_u  = 0,  s_ofq_v  = 0,  s_ofq_w  = 0;   /* Q8 一阶低通状态 */
 
 /* 20kHz 控制环门控: 零电流标定完成前不跑(否则会拿全 0 偏置去算电流 → 误报过流) */
 static volatile uint8_t s_foc_loop_en = 0U;
@@ -149,6 +163,14 @@ static void App_CalibrateOffsets(void)
     s_off_v = (uint16_t)(sum_v / APP_CAL_SAMPLES);
     s_off_w = (uint16_t)(sum_w / APP_CAL_SAMPLES);
     s_off_ok = 1U;
+
+    /* 第二套(“六路全关”)零点先等于标定值，之后 idle-off 期间自适应跟踪 */
+    s_offo_u = s_off_u;
+    s_offo_v = s_off_v;
+    s_offo_w = s_off_w;
+    s_ofq_u  = ((int32_t)s_off_u) << 8;
+    s_ofq_v  = ((int32_t)s_off_v) << 8;
+    s_ofq_w  = ((int32_t)s_off_w) << 8;
 
     LOGD("[Calib] Offset: U=%u V=%u W=%u (zero-current)\r\n",
          s_off_u, s_off_v, s_off_w);
@@ -639,12 +661,21 @@ static void App_ReportSlow(uint32_t now)
         if (vbus_v >= 0.0f) {
             g_foc.current.vbus = vbus_v;
         }
-        LOGD("[ADCR] fw=%s vbraw=%u vb=%.1fV | cntU=%u cntV=%u cntW=%u | offU=%u offV=%u offW=%u | Iu=%.2f Iv=%.2f Iw=%.2f | shunt=%.4f gain=%.1f\r\n",
-             FW_BUILD_TAG, (unsigned)BSP_ADC_GetVbusRaw(), vbus_v,
-             (unsigned)ru, (unsigned)rv, (unsigned)rw,
-             (unsigned)s_off_u, (unsigned)s_off_v, (unsigned)s_off_w,
-             g_foc.current.u, g_foc.current.v, g_foc.current.w,
-             g_foc.config.shunt_r, g_foc.config.op_gain);
+        {
+            uint8_t  po_now = FOC_Control_GetPwmIdleOffActive();
+            uint16_t eo_u = (po_now != 0U) ? s_offo_u : s_off_u;
+            uint16_t eo_v = (po_now != 0U) ? s_offo_v : s_off_v;
+            uint16_t eo_w = (po_now != 0U) ? s_offo_w : s_off_w;
+            /* ★ 2026-10-25 A2e: 打**当前生效**的那套零点（见 s_offo_* 说明）。
+               po=1 时它是"六路全关"下自适应的那套 ⇒ offU 会随状态变化，
+               同时 Iu/Iv/Iw 应该回到 ±0.1A 以内（以前是 ~0.6A 的假矢量）。 */
+            LOGD("[ADCR] fw=%s vbraw=%u vb=%.1fV | cntU=%u cntV=%u cntW=%u | offU=%u offV=%u offW=%u po=%u | Iu=%.2f Iv=%.2f Iw=%.2f | shunt=%.4f gain=%.1f\r\n",
+                 FW_BUILD_TAG, (unsigned)BSP_ADC_GetVbusRaw(), vbus_v,
+                 (unsigned)ru, (unsigned)rv, (unsigned)rw,
+                 (unsigned)eo_u, (unsigned)eo_v, (unsigned)eo_w, (unsigned)po_now,
+                 g_foc.current.u, g_foc.current.v, g_foc.current.w,
+                 g_foc.config.shunt_r, g_foc.config.op_gain);
+        }
 
         /* 负载下母线塌陷是"电流环顶到限幅也拉不到目标"的头号嫌疑 */
         if (vbus_v >= 0.0f && vbus_v < 8.0f && g_foc.state != FOC_STATE_IDLE) {
@@ -790,11 +821,30 @@ void App_OnCurrentSample(void)
         if (s_i_k == 0.0f) {
             s_i_k = CFG_CURRENT_SIGN * vref / ((res - 1.0f) * scale);
         }
-        float iu = ((float)ru - (float)s_off_u) * s_i_k;
-        float iv = ((float)rv - (float)s_off_v) * s_i_k;
+
+        float ou = (float)s_off_u;
+        float ov = (float)s_off_v;
+
+        /* ★★ 2026-10-25 A2e: 六路全关(idle-off)期间用第二套零点, 并让它自适应。
+           原因见 s_offo_* 的注释: 标定态是"下管全通", idle-off 是"六路全关",
+           运放共模不同 ⇒ 静止时读出 ~0.6A 假矢量。全关断时电机里没有电流,
+           所以可以放心把零点跟踪到当前读数(一阶低通, tau = 128 拍 = 6.4ms)。 */
+        if (FOC_Control_GetPwmIdleOffActive() != 0U) {
+            s_ofq_u += ((((int32_t)ru) << 8) - s_ofq_u) >> 7;
+            s_ofq_v += ((((int32_t)rv) << 8) - s_ofq_v) >> 7;
+            s_ofq_w += ((((int32_t)rw) << 8) - s_ofq_w) >> 7;
+            s_offo_u = (uint16_t)(s_ofq_u >> 8);
+            s_offo_v = (uint16_t)(s_ofq_v >> 8);
+            s_offo_w = (uint16_t)(s_ofq_w >> 8);
+            ou = (float)s_offo_u;
+            ov = (float)s_offo_v;
+        }
+
+        float iu = ((float)ru - ou) * s_i_k;
+        float iv = ((float)rv - ov) * s_i_k;
         g_foc.current.u = iu;
         g_foc.current.v = iv;
-        g_foc.current.w = -(iu + iv);
+        g_foc.current.w = -(iu + iv);      /* W 相仍由 u/v 推出, 保持三相和=0 不变量 */
     }
 
     if (s_foc_loop_en) {
@@ -975,7 +1025,7 @@ static void App_ReportProf(uint32_t now)
              " | PRE n=%lu avg=%lu.%02luus max=%lu.%02luus"
              " | LAW n=%lu avg=%lu.%02luus max=%lu.%02luus"
              " | CUR n=%lu avg=%lu.%02luus max=%lu.%02luus"
-             " | idle=%lu.%02lu%% | rttdrop=%lu\r\n",
+             " | idle=%lu.%02lu%% | rttdrop=%lu rttbad=%lu\r\n",
              (unsigned long)(p.win_cycles / clk1000),
              (unsigned long)p.isr_count,
              (unsigned long)(isr_pm / 100U), (unsigned long)(isr_pm % 100U),
@@ -1004,7 +1054,7 @@ static void App_ReportProf(uint32_t now)
              (unsigned long)(cur_avg / 100U), (unsigned long)(cur_avg % 100U),
              (unsigned long)(cur_max / 100U), (unsigned long)(cur_max % 100U),
              (unsigned long)(idl_pm / 100U), (unsigned long)(idl_pm % 100U),
-             (unsigned long)rtt_drop);
+             (unsigned long)rtt_drop, (unsigned long)BSP_Log_GetRttBad());
     }
 }
 

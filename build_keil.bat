@@ -4,7 +4,9 @@ setlocal EnableExtensions
 rem Build the BldcClamp Keil target from the repository root.
 set "PROJECT=%~dp0MDK-ARM\BldcClamp.uvprojx"
 set "TARGET=BldcClamp"
-set "OUTPUT_DIR=%~dp0MDK-ARM\BldcClamp"
+rem 输出目录由 uvprojx 的 <OutputDirectory> 决定 = ..\_archive\builds\，
+rem <OutputName> 固定为 BldcClamp ⇒ 每次只产出一套 BldcClamp.*（不再一版一个文件名）
+set "OUTPUT_DIR=%~dp0_archive\builds"
 set "BUILD_LOG=%OUTPUT_DIR%\BldcClamp.build_log.htm"
 set "AXF_FILE=%OUTPUT_DIR%\BldcClamp.axf"
 set "BUILD_MODE=%~1"
