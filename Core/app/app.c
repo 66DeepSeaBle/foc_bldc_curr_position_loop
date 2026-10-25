@@ -35,7 +35,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-25 cal30 20k adv-off drive-nogate"
+#define FW_BUILD_TAG  "2026-10-25 cal30 20k A2d"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U
@@ -546,6 +546,18 @@ static void App_HandleKey(int ch)
         FOC_App_SetSpeed(FOC_App_GetSpeed() + 20.0f);
         LOGD("[CMD] speed band -> %.0f deg/s\r\n", FOC_App_GetSpeed());
     } else if (ch == '{') {
+        /* ★ 2026-10-25 原 'E' 精度模式键已删除。
+           理由(实测, tag `20k A2c`): 把 arrive_tol 从 6° 收到 1° 后一切
+           限幅都按预期跟进了(日志可见 hl=0, 死区已释放), 但转子就是不动:
+             齿槽周期 15°, 稳定平衡点在 73.34°, 目标 70° 落在两齿槽之间的
+             **斜坡**上; 要把它按在那里需要持续输出 ≈1.9A 对抗齿槽弹簧,
+             而近目标可用电流只有 POS_INTEG_MAX_A=0.8A / POS_SOFT_IQ_A=1.30A
+             ⇒ 顶不动, Iqref 恒为 0, 打 `[POS] BLOCKED?`。
+           若强行放开这些限幅, 73.34 <-> 55.65 的粘滞-滑移极限环会立刻
+           回来(= T70 振动, A2c 刚修好)。
+           ⇒ 这是机构物理上限, 不是软件参数问题: **定位精度 = 一个齿槽内
+           的残差(实测 1.8~3.4°)**。上层必须用 FOC_App_GetPos() 读实际位置,
+           不能假设它等于目标。要做 ±1° 只能换编码器。 */
         FOC_App_SetSpeed(FOC_App_GetSpeed() - 20.0f);
         LOGD("[CMD] speed band -> %.0f deg/s\r\n", FOC_App_GetSpeed());
     } else if (ch >= '0' && ch <= '9') {

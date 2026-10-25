@@ -28,14 +28,13 @@
   */
 #ifndef __BOARD_CONFIG_H__
 #define __BOARD_CONFIG_H__
-
 #include "main.h"
 #include "foc_types.h"   /* 只为拿到 FOC_CTRL_HZ(控制拍频唯一真源) */
 
 /* ==========================================================================
  * 1) 平台选择
  * ========================================================================== */
-#define CFG_PLATFORM_STM32G4      1
+#define CFG_PLATFORM_STM32G4      180
 #define CFG_PLATFORM_GD32         2
 #define CFG_PLATFORM              CFG_PLATFORM_STM32G4
 

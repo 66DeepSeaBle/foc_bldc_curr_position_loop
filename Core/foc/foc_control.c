@@ -1245,10 +1245,65 @@ static int32_t s_tm_done_drive  = 0;
    |err|<POS_TM_DONE_DEG 或超过 POS_TM_TAIL_TICKS 安全帽。
    这样“末速归零”才真正实现, 齿槽能直接捣住。 */
 #define POS_TM_KV_A_PER_ERPM    0.030f   /* 轨迹期间速度环增益(A/eRPM) */
+
+/* ★★★ 2026-10-25 对比测试 B1: 位置微调(trim)的**斜率限制** ----------------
+ * 背景(实测): 过齿槽谷底时转子顶住不动 ⇒ verr 涨到 ~39° ⇒
+ *   trim = 0.037A/° × 39° ≈ 1.44A 在 ~200ms 内"攒"出来;
+ *   一旦脱困, 这 1.44A 不会立即消失 ⇒ 102ms 冲出 108°(规划只有 751°/s) ⇒ 超速41%。
+ * 处理: **只限增、不限减**。掉队时电流慢慢爬(不攒弹簧), 一旦追上/超速,
+ *       trim 可以立刻回落(刹车不被拖慢)。
+ * ⚠⚠ 2026-10-25 **实测对比结论: B1 比 A **差得多**, 已置 0 关闭。**
+ *   ---- 失效机理(由 `t7200 -> 70` 的日志定量) ----
+ *   那个 slew 限的是 `trim > s_tm_trim_out + dmax`, 也就是**只限方向、
+ *   不管符号**。但 trim 从"驱动"翻到"刹车"恰恰是**负→正的大幅上升**:
+ *     实测 t=65899 转子卡在 179.83°不动, verr=-32.7° ⇒ trim=-0.98A(往负推);
+ *     一脱困就冲到 1240°/s, verr 翻到 +213° ⇒ trim 需要立刻到 +2.0A 刹车;
+ *     但 4A/s 的限速下要走 2.98A ⇒ **需要 725ms**;
+ *     这 725ms 里几乎没有刹车力矩 ⇒ 转子从 179.83° 一路冲到 **-228.73°**
+ *     (过冲 300°), 然后再被拉回来。用户看到的"停顿 + 回转"就是它。
+ *   教训: "只限增"不等于"不限刹车" —— 必须按**净力矩的绝对值**或
+ *         **符号翻转时无条件免限**。如果以后要重做, 两件事必做:
+ *         ① 符号翻转(trim·s_tm_trim_out < 0)时直接接位、免限速;
+ *         ② 或直接限 `iq_f + trim + damp` 的净输出, 而不是单限 trim。
+ * -------------------------------------------------------------------------- */
+#define POS_TRIM_SLEW_EN        0
+#define POS_TRIM_SLEW_UP_A_S    4.0f
+#if POS_TRIM_SLEW_EN
+static float   s_tm_trim_out    = 0.0f;   /* 上一拍的 trim(slew 状态) */
+#endif
+
+/* ★★★ 2026-10-25 跑飞保护的门槛改成**自适应** -----------------------------
+ * 原来是硬编码 `|err| > 720°`(2 圈) ⇒ 实测 `t7200`(dist=6480°) **一发出就立刻
+ * FAULT 0x0010**, 大角度根本走不了; 而 `t720` 正好压在门槛上, 有时能走有时不能。
+ * 现在: 换目标那一拍把"当时的指令距离"记为基线, 允许超基线 POS_RUNAWAY_MARGIN_DEG
+ *       (另外给 POS_RUNAWAY_MIN_DEG 的下限, 保证小角度移动仍然有足够余量)。
+ * 真跑飞(历史上 Pos 跑到过 -39616°)仍然能被抓住; 另有独立的
+ * `|vsp|>1500eRPM 持续 200ms` 飞车保护作为第一道防线(未动)。
+ * -------------------------------------------------------------------------- */
+#define POS_RUNAWAY_MARGIN_DEG  3600.0f  /* 10 圈余量(2026-10-25: 2160→3600) */
+#define POS_RUNAWAY_MIN_DEG     720.0f   /* 绝对下限(2 圈) */
+static float   s_pos_err_allow  = POS_RUNAWAY_MIN_DEG;
+static float   s_pos_tgt_seen   = 1.0e9f;   /* 上次看到的指令目标(识别换目标) */
+static uint32_t s_pos_allow_tick = 0U;      /* 上次跑位置律的 tick(识别中断) */
+
 #define POS_TM_DONE_DEG         3.0f     /* |err| 小于它 ⇒ 轨迹交由普通逻辑收尾 */
 #define POS_TM_TAIL_TICKS       (1500U * FOC_TICKS_PER_MS)  /* 收尾段最长再扰 1.5s */
 /* ★ cal19 新增两个量 */
 #define POS_TM_START_DEG        12.0f    /* 起步破黏窗口: 离起点不足它就给静摩擦 */
+/* ★★★ 2026-10-25 收尾段"强制静摩擦前馈"的误差门限 ---------------------------
+ * 背景(实测 `t70`, band 2.50):
+ *   t=64830 Pos=73.34 tv=-3.3 Iqref=-1.78 ff=-1.45   ← 卡在齿槽不动, 恒推 1.84A
+ *   t=65133 Pos=55.65 tv=+14.3 Iqref=+1.84          ← 一下滑掉整一个扇区(17.7°)
+ *   t=65234 Pos=59.53 …
+ *   在 73.34↔55.65 之间来回 = 用户听到的"到 T70 振动很厉害"。
+ * 原因: cal22 的 `hw==2 收尾掉队` 对 |verr| 只要 >1° 就**强制**塞 1.45A 静摩擦。
+ *   而 3.3° 根本不到一个齿槽(15.47°), 1.45A 远超该齿槽的保持力矩 ⇒ 一推就滑
+ *   一整个扇区, 再被推回来 ⇒ 粘滞-滑移极限环。
+ * 现在: 只有 |verr| > 8°(真掉队, 才需要全力敲齿槽) 才给静摩擦前馈; 小于它
+ *   就让 trim(0.030A/°) 自己去处理 —— 3.3° 时只有 0.1A, 敲不动齿槽,
+ *   转子就安静地停在原地, 随后 |v| 降下来由"到位扇力"接手。
+ * -------------------------------------------------------------------------- */
+#define POS_TM_TAIL_FF_DEG      8.0f
 #define POS_TM_END_QUIET_TICKS  (120U * FOC_TICKS_PER_MS) /* ★ cal30: 60→120ms 无霍尔边沿才结束
                                              等效“已慢于 **~129°/s**”—— 这是关键:
                                              60ms 只等效 <258°/s, 而实测到位余速
@@ -1888,15 +1943,38 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
        位置环必须有"跑飞"兜底: 一旦角度/方向出错(实测: ALIGN 未标定 offset),
        闭环会变成正反馈, 电机一路加速 —— 日志里 Pos 到过 -39616°(110 圈)、
        vsp 撞死 ±3000 限幅、相电流 5.4A、机构被抽得飞快。两道门:
-       ① 位置偏离目标超过 720°(2 圈) —— 任何正常运动都不可能;
        ② 滤波速度持续 200ms(4000 拍) 超过 1500eRPM —— 飞车。
+       ① 位置偏离目标超过基线+余量(见下) —— 原为硬编码 720°。
        命中就 FAULT + 关 PWM, 按 'r' 清故障重来。 */
-    if (fabsf(foc->position_loop.pos_err_deg) > 720.0f) {
-        LOGW("[POS] RUNAWAY: err=%ddeg > 720 -> FAULT\r\n",
-             (int)foc->position_loop.pos_err_deg);
-        FOC_Control_SetFault(foc, 0x0010);
-        s_pos_fast_cnt = 0U;
-        return;
+    /* ---- ★ 2026-10-25 自适应跑飞门槛(代替原来的硬编码 720°) ----
+       ① 换目标的那一拍: 把"当时的指令距离"记为基线, 允许超基线
+          POS_RUNAWAY_MARGIN_DEG。 ⇒ `t7200`(dist=6480°) 不再一发出就 FAULT;
+             `t720` 也不再压在原门槛上"有时行有时不行"。
+       ② 位置律中间断过(ALIGN / STARTUP / 故障重来, 位置可能被重置) ⇒ 也要
+          重新给基线, 否则一换状态就被判跑飞。 */
+    {
+        float e = fabsf(foc->position_loop.pos_err_deg);
+        uint8_t relatch = 0U;
+
+        if (foc->pos_target_deg_cmd != s_pos_tgt_seen) { relatch = 1U; }
+        if ((s_pos_allow_tick != 0U) &&
+            ((foc->tick - s_pos_allow_tick) > 500U)) { relatch = 1U; }
+        if (relatch != 0U) {
+            s_pos_tgt_seen  = foc->pos_target_deg_cmd;
+            s_pos_err_allow = e + POS_RUNAWAY_MARGIN_DEG;
+            if (s_pos_err_allow < POS_RUNAWAY_MIN_DEG) {
+                s_pos_err_allow = POS_RUNAWAY_MIN_DEG;
+            }
+        }
+        s_pos_allow_tick = foc->tick;
+
+        if (e > s_pos_err_allow) {
+            LOGW("[POS] RUNAWAY: err=%ddeg > allow=%ddeg -> FAULT\r\n",
+                 (int)e, (int)s_pos_err_allow);
+            FOC_Control_SetFault(foc, 0x0010);
+            s_pos_fast_cnt = 0U;
+            return;
+        }
     }
     if (fabsf(s_pos_erpm_filt) > 1500.0f) {
         s_pos_fast_cnt++;
@@ -2114,7 +2192,14 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
 
         /* ★★ 2026-10-11p 到位死区(施密特): 先更新状态, 再决定这一拍给不给力 */
         {
-            if (fabsf(err) < POS_HOLD_IN_DEG) {
+            float hold_in = POS_HOLD_IN_DEG;
+            /* ★ 2026-10-25 精度模式(E 键): 到位死区必须**跟着 arrive_tol 一起缩**。
+               否则 arrive_tol 改到 1.0° 也没用 —— 3.34° < 7.5° ⇒ 直接进死区
+               撑力, 电机一点不动(实测 A2b 日志)。 */
+            if (foc->position_loop.arrive_tol_deg < hold_in) {
+                hold_in = foc->position_loop.arrive_tol_deg;
+            }
+            if (fabsf(err) < hold_in) {
                 if (s_pos_hold_in_tick == 0U) s_pos_hold_in_tick = foc->tick;
                 if ((foc->tick - s_pos_hold_in_tick) > POS_HOLD_SETTLE_TICKS) {
                     s_pos_hold = 1U;      /* 确实停下来了 ⇒ 进入死区 */
@@ -2335,7 +2420,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         if ((t < (ta * 1.5f)) &&
                             (fabsf(pos_now_deg - s_tm_deg0) < POS_TM_START_DEG)) {
                             hw = 1U;                              /* ② 起步破黏 */
-                        } else if ((t > Tm) && (fabsf(verr) > 1.0f)) {
+                        } else if ((t > Tm) && (fabsf(verr) > POS_TM_TAIL_FF_DEG)) {
                             hw   = 2U;                            /* ③ 收尾掉队 */
                             v_ff = (verr >= 0.0f) ? 50.0f : -50.0f;
                         }
@@ -2357,6 +2442,17 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         trim = POS_TM_P_TRIM_A_PER_DEG * verr;
                         if (trim >  POS_TM_P_TRIM_MAX_A) trim =  POS_TM_P_TRIM_MAX_A;
                         if (trim < -POS_TM_P_TRIM_MAX_A) trim = -POS_TM_P_TRIM_MAX_A;
+                        /* ★ 2026-10-25 B1: trim 斜率限制(**只限增**, 减小不限速)
+                           见 POS_TRIM_SLEW_EN 的说明。 */
+#if POS_TRIM_SLEW_EN
+                        {
+                            float dmax = POS_TRIM_SLEW_UP_A_S * dt_s;
+                            if (trim > (s_tm_trim_out + dmax)) {
+                                trim = s_tm_trim_out + dmax;
+                            }
+                            s_tm_trim_out = trim;
+                        }
+#endif
                         /* ③ 速度阻尼(用模型观测速度, 不用毛刺测速; 自带限幅) */
                         damp = POS_TM_DAMP_A_PER_DEG_S * (v_eff - s_tm_vobs);
                         if (damp >  POS_TM_DAMP_MAX_A) damp =  POS_TM_DAMP_MAX_A;
@@ -2791,10 +2887,17 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         s_pos_integ = 0.0f;
                     }
                     /* ★ 10-11k "半个扇区内卡住" ⇒ 静默接受(见 POS_ACCEPT_BAND_DEG) */
-                    if (fabsf(err) < POS_ACCEPT_BAND_DEG &&
-                        (foc->tick - foc->hall.edge_tick) > POS_INTEG_STALL_TICKS) {
-                        iq_target   = 0.0f;
-                        s_pos_integ = 0.0f;
+                    {   float acc_band = POS_ACCEPT_BAND_DEG;
+                        /* ★ 2026-10-25 精度模式: 同样要跟着 arrive_tol 缩,
+                           否则 3.34° < 8° ⇒ 永远被"静默接受", E 键白按。 */
+                        if (foc->position_loop.arrive_tol_deg < acc_band) {
+                            acc_band = foc->position_loop.arrive_tol_deg;
+                        }
+                        if (fabsf(err) < acc_band &&
+                            (foc->tick - foc->hall.edge_tick) > POS_INTEG_STALL_TICKS) {
+                            iq_target   = 0.0f;
+                            s_pos_integ = 0.0f;
+                        }
                     }
                     /* ★★ 2026-10-11i 总输出按状态分档限幅:
                        ① |v|<40(基本没动) ⇒ 允许 2.5A —— 这是掰开齿槽的**唯一**手段;
@@ -3636,10 +3739,19 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
     s_tm_max_tverr   = 0.0f;   /* ★ 本次轨迹的峰值指标 */
     s_tm_max_iq      = 0.0f;
     s_tm_max_drive   = POS_TM_IQ_DRIVE_DEF_A;
+#if POS_TRIM_SLEW_EN
+    s_tm_trim_out    = 0.0f;   /* ★ B1: slew 状态随轨迹复位 */
+#endif
     LOGD("[TM] %.1f -> %.1fdeg (D=%.1f) in %.2fs | accel %.2fs + cruise %.2fs + decel %.2fs + creep %.2fs | v_cruise=%.1f -> v_app=%.1f deg/s\r\n",
          pos0, foc->pos_target_deg_cmd, D, T,
          T * POS_TM_TA_FRAC, T * POS_TM_TC_FRAC, T * POS_TM_TD_FRAC,
          T * (1.0f - POS_TM_TA_FRAC - POS_TM_TC_FRAC - POS_TM_TD_FRAC),
+         s_tm_vc, s_tm_vapp);
+    /* ★ 2026-10-25 大角度排障: 把武装结果也打出来。
+       如果发了命令却不动, 看这一行就知道是"没武装"还是"武装了但没跑"。 */
+    LOGD("[TM] armed | tgt=%.1f sgn=%d Ttick=%lu (%.2fs) | vc=%.1f vapp=%.1f\r\n",
+         foc->pos_target_deg_cmd, (int)s_tm_sgn,
+         (unsigned long)s_tm_Ttick, (float)s_tm_Ttick / (float)FOC_CTRL_HZ,
          s_tm_vc, s_tm_vapp);
 }
 
@@ -3823,6 +3935,25 @@ float FOC_App_GetIqLimitDrive(void) { return s_iq_drive_cap; }
 float FOC_App_GetIqLimitTrim(void)  { return s_trim_cap; }
 float FOC_App_GetIqLimitDamp(void)  { return s_tm_damp_cap; }
 float FOC_App_GetIqLimitKick(void)  { return s_kick_cap; }
+
+/* ★ 2026-10-25 上层轮询用的只读查询 */
+float FOC_App_GetPos(void)
+{
+    if (s_app_foc == 0) { return 0.0f; }
+    return AngleObserver_GetMechDeg(&s_app_foc->angle, s_app_foc->config.pole_pairs);
+}
+
+uint8_t FOC_App_Arrived(void)
+{
+    if (s_app_foc == 0) { return 0U; }
+    return (s_app_foc->position_loop.arrived != 0U) ? 1U : 0U;
+}
+
+uint8_t FOC_App_IsFault(void)
+{
+    if (s_app_foc == 0) { return 0U; }
+    return FOC_Control_IsFault(s_app_foc);
+}
 
 /* 取走上一段定时轨迹的客观指标(主循环调, 读即清)。
    返回 1 = 有新数据。单位: 0.001° / 0.001A */

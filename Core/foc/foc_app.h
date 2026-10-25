@@ -130,6 +130,14 @@ float   FOC_App_EstimateTime(float dist_deg, float speed_deg_s);
 /* 硬件链路实测参数(需要传入零电流 ADC 码值, 例如 [ADCR] 里的 offU) */
 void    FOC_App_GetHw(uint16_t zero_counts, FOC_AppHw_t *out);
 
+/* ---- 只读状态查询(给上层轮询用) ------------------------------------------ */
+/* 当前机械角度(多圈、可负)。上电/重新标定后原点会重置, 上层需自己幂等 */
+float   FOC_App_GetPos(void);
+/* 1 = 已在目标容差内且停住(arrive_ms 消抖已过); 0 = 还在走/已超差 */
+uint8_t FOC_App_Arrived(void);
+/* 1 = 处于 FAULT 状态(过流/跑飞), 需重新标定(按 'r' 或上层重发标定流程) */
+uint8_t FOC_App_IsFault(void);
+
 #ifdef __cplusplus
 }
 #endif
