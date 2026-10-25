@@ -25,6 +25,7 @@
 #include "bsp.h"
 #include "sensor.h"
 #include "foc_control.h"
+#include "foc_app.h"
 #include "vofa.h"
 #include "log.h"
 #include "SEGGER_RTT.h"
@@ -34,7 +35,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-24 cal30 20k lean"
+#define FW_BUILD_TAG  "2026-10-25 cal30 20k adv-off drive-nogate"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U
@@ -293,40 +294,102 @@ static const char *Cmd_Num(const char *p, float *out)
     return p;
 }
 
-/* 1 = 是定时命令(已填 tgt/dur); 0 = 不是(例如只按了 't') */
+/* 解析 `t<deg> d<sec>`。★ 2026-10-24 重写: 允许
+     · 任意顺序: `t180 d2` / `d2 t180`
+     · 大小写混用: `T180 D2`
+     · 分隔符可省/可为空格或 = 或 :  —— `t180d2` `t=180 d:2` `T180 D2`
+   返回位掩码(见 CMD_HAS_*) */
+#define CMD_HAS_T   0x01U
+#define CMD_HAS_D   0x02U
+
 static uint8_t Cmd_ParseTimed(const char *buf, float *tgt, float *dur)
 {
     const char *p = buf;
-    uint8_t have_t = 0U;
+    uint8_t flags = 0U;
 
     *tgt = 0.0f;
     *dur = 0.0f;
     while (*p != '\0') {
         char c = *p;
+
         if (c == 't' || c == 'T' || c == 'd' || c == 'D') {
-            const char *q  = p + 1;
-            const char *q0 = q;
+            const char *q = p + 1;
+            const char *q0;
             float v = 0.0f;
-            if (*q == '+' || *q == '-') q++;
+
+            /* 跳过分隔符: t=180 / t:180 / t 180 都能认 */
+            while ((*q == ' ') || (*q == '=') || (*q == ':')) { q++; }
+            q0 = q;
+            if (*q == '+' || *q == '-') { q++; }
             if ((*q >= '0' && *q <= '9') || *q == '.') {
                 q = Cmd_Num(q0, &v);
                 if (c == 't' || c == 'T') {
-                    *tgt    = v;
-                    have_t  = 1U;
+                    *tgt = v;
+                    flags |= CMD_HAS_T;
                 } else {
                     *dur = v;
+                    flags |= CMD_HAS_D;
                 }
-                p = q - 1;              /* 循环末尾会 p++ */
+                p = q - 1;              /* 循环末尾统一 p++ */
             }
         }
         p++;
     }
-    return have_t;
+    return flags;
+}
+
+/* 命令缓冲超时: 原来按了 't' 却忘了回车, 之后所有单键都会被吞进缓冲
+   (用户感受就是"按键都不管用了"), 只能靠回车才能恢复。现在 3s 没继续输入就丢。 */
+#define CMD_TIMEOUT_MS   3000U
+static uint32_t s_cmd_last_ms = 0U;
+
+/* 把一条定时命令真正执行掉(见下面的 App_FeedCommand)
+   ★ 2026-10-24: 核心需求 —— **D 做不到就只执行 T**:
+     给的 d 不可用(没给 / 超范围) ⇒ 用当前「速度档」自动算时长, 目标照样执行。 */
+static void App_ExecTimed(float tgt, uint8_t has_d, float dur)
+{
+    float now_deg = g_sensor.GetMechDeg(&g_foc);
+    float de      = tgt - now_deg;
+    float T;
+
+    if (has_d && (dur > 0.0f) && (dur <= 60.0f)) {
+        LOGD("[CMD] timed: t%.1f d%.2f (now=%.1f dist=%.1f)\r\n",
+             tgt, dur, now_deg, de);
+        FOC_Control_SetTimedTarget(&g_foc, tgt, dur);
+        AutoStartIfIdle();
+        return;
+    }
+    if (has_d) {
+        LOGD("[CMD] d%.2f unusable (valid 0.05~60s) -> use speed band %.0f deg/s\r\n",
+             dur, FOC_App_GetSpeed());
+    }
+
+    T = FOC_App_EstimateTime(de, 0.0f);
+    if (T <= 0.0f) {
+        LOGD("[CMD] already at %.1fdeg (dist=%.2f) -> hold\r\n", tgt, de);
+        FOC_Control_SetPosTarget(&g_foc, tgt);
+        AutoStartIfIdle();
+        return;
+    }
+    LOGD("[CMD] t%.1f -> dist=%.1f | speed %.0f deg/s -> T=%.2fs\r\n",
+         tgt, de, FOC_App_GetSpeed(), T);
+    FOC_Control_SetTimedTarget(&g_foc, tgt, T);
+    AutoStartIfIdle();
 }
 
 /* 把字符喂给命令缓冲。返回 1 = 已消费(不再走单键处理) */
 static uint8_t App_FeedCommand(char ch)
 {
+    uint32_t now = BSP_Time_Ms();
+
+    /* ★ 超时丢弃 */
+    if (s_cmd_pending && ((now - s_cmd_last_ms) > CMD_TIMEOUT_MS)) {
+        LOGD("[CMD] command timeout -> dropped\r\n");
+        s_cmd_pending = 0U;
+        s_cmd_len     = 0U;
+        s_cmd_buf[0]  = '\0';
+    }
+
     if (!s_cmd_pending && !s_hall_verify && (ch == 't' || ch == 'T')) {
         s_cmd_pending = 1U;
         s_cmd_len     = 0U;
@@ -335,27 +398,34 @@ static uint8_t App_FeedCommand(char ch)
     if (!s_cmd_pending) {
         return 0U;
     }
+    s_cmd_last_ms = now;
 
     if (ch == '\r' || ch == '\n') {
         float tgt = 0.0f, dur = 0.0f;
-        if (Cmd_ParseTimed(s_cmd_buf, &tgt, &dur)) {
-            LOGD("[CMD] timed: t%.1f d%.2f\r\n", tgt, dur);
-            FOC_Control_SetTimedTarget(&g_foc, tgt, dur);
-            AutoStartIfIdle();
-        } else if (s_cmd_len == 1U && (s_cmd_buf[0] == 't' || s_cmd_buf[0] == 'T')) {
+        uint8_t f;
+        uint8_t was_len = s_cmd_len;
+        char    was_0   = s_cmd_buf[0];
+
+        f = Cmd_ParseTimed(s_cmd_buf, &tgt, &dur);
+
+        s_cmd_pending = 0U;
+        s_cmd_len     = 0U;
+        s_cmd_buf[0]  = '\0';
+
+        if ((f & CMD_HAS_T) != 0U) {
+            App_ExecTimed(tgt, (uint8_t)(((f & CMD_HAS_D) != 0U) ? 1U : 0U), dur);
+        } else if ((f & CMD_HAS_D) != 0U) {
+            LOGD("[CMD] only d%.2f given, missing t<deg> -> ignored\r\n", dur);
+        } else if ((was_len == 1U) && ((was_0 == 't') || (was_0 == 'T'))) {
             /* 只按 't' + 回车 = 原来的"停止开环测试"语义 */
             if (g_foc.ol_active) {
                 FOC_Control_StopOpenLoopTest(&g_foc, "key T");
             } else {
                 LOGD("[CMD] no open-loop test running\n");
             }
-        } else if (s_cmd_len > 0U) {
-            LOGD("[CMD] unknown command \"%s\" (use: t<deg> d<sec> + Enter)\r\n",
-                 s_cmd_buf);
+        } else if (was_len != 0U) {
+            LOGD("[CMD] unknown command (use: t<deg> [d<sec>] + Enter)\r\n");
         }
-        s_cmd_pending = 0U;
-        s_cmd_len     = 0U;
-        s_cmd_buf[0]  = '\0';
         return 1U;
     }
     if ((ch == 8 || ch == 127) && s_cmd_len > 0U) {   /* 退格 */
@@ -459,6 +529,25 @@ static void App_HandleKey(int ch)
         FOC_Control_SetTorqueProbe(&g_foc, +2.5f, 600);   /* +Iq 探针 */
     } else if (ch == 'k' || ch == 'K') {
         FOC_Control_SetTorqueProbe(&g_foc, -2.5f, 600);   /* -Iq 探针 */
+    } else if (ch == ']') {
+        FOC_App_SetTorque(FOC_App_GetTorque() + 0.1f);
+        LOGD("[CMD] torque band -> %.2fA (%.2f~%.2f) | drive=%.2f trim=%.2f damp=%.2f kick=%.2f\r\n",
+             FOC_App_GetTorque(),
+             (double)FOC_APP_TORQUE_MIN_A, (double)FOC_APP_TORQUE_MAX_A,
+             FOC_App_GetIqLimitDrive(), FOC_App_GetIqLimitTrim(),
+             FOC_App_GetIqLimitDamp(), FOC_App_GetIqLimitKick());
+    } else if (ch == '[') {
+        FOC_App_SetTorque(FOC_App_GetTorque() - 0.1f);
+        LOGD("[CMD] torque band -> %.2fA | drive=%.2f trim=%.2f damp=%.2f kick=%.2f\r\n",
+             FOC_App_GetTorque(),
+             FOC_App_GetIqLimitDrive(), FOC_App_GetIqLimitTrim(),
+             FOC_App_GetIqLimitDamp(), FOC_App_GetIqLimitKick());
+    } else if (ch == '}') {
+        FOC_App_SetSpeed(FOC_App_GetSpeed() + 20.0f);
+        LOGD("[CMD] speed band -> %.0f deg/s\r\n", FOC_App_GetSpeed());
+    } else if (ch == '{') {
+        FOC_App_SetSpeed(FOC_App_GetSpeed() - 20.0f);
+        LOGD("[CMD] speed band -> %.0f deg/s\r\n", FOC_App_GetSpeed());
     } else if (ch >= '0' && ch <= '9') {
         /* 数字键 = 45°×n。
            ★★★ cal20 (2026-10-18) —— **一律走定时轨迹**。
@@ -735,10 +824,13 @@ static void App_PrintKeys(void)
     LOGD("[MAIN] Keys: o=MANUAL  u/i=V+/-0.01  n/m=V+/-0.05  h/l=freq +/-1Hz  f=dir  t=stop\r\n");
     LOGD("[MAIN] Keys: s=auto V/f test  p=PWM smoke test  r=re-align  D=dir_rev(cap)  y=torque\r\n");
     LOGD("[MAIN] Keys: j=+Iq pulse  k=-Iq pulse  z=target 0  0~9=digit*45deg(auto-start)  c=hall verify\r\n");
-    LOGD("[MAIN] Keys: t<deg> d<sec> + Enter = TIMED move (accel/cruise/decel/creep = 2/9,3/9,2/9,2/9)\r\n");
+    LOGD("[MAIN] Keys: t<deg> [d<sec>] + Enter = timed move (d optional, order free)\r\n");
     LOGD("[MAIN] Keys: 0~9/z default timed move: any angle in %.1fs (ramp-to-zero)\r\n",
          (double)FOC_POS_DEFAULT_TM_S);
     LOGD("[MAIN] Keys: v=verbose log(25ms)  w=VOFA wave on/off  A=PWM idle-off @target\r\n");
+    LOGD("[MAIN] Keys: ]/ [ = torque band +/-0.1A   }/ { = speed band +/-20 deg/s\r\n");
+    LOGD("[MAIN] Band now: torque=%.2fA (max %.2f) speed=%.0f deg/s\r\n",
+         FOC_App_GetTorque(), (double)FOC_APP_TORQUE_MAX_A, FOC_App_GetSpeed());
     LOGD("[ANG] idx,state,hall,synced,elec_deg,mech_deg,erpm\r\n");
 }
 
@@ -770,6 +862,7 @@ void App_Init(void)
 
     App_ConfigDefaults(&config);
     FOC_Control_Init(&g_foc, &config);
+    FOC_App_Init(&g_foc);          /* ★ 应用层接口: 力矩档/速度档回到默认 */
     App_PrintBanner();
     App_PrintCalib();
 
@@ -917,6 +1010,19 @@ static void App_PollPwmEvent(void)
     } else if (ev == 2U) {
         LOGD("[PWM] idle-on  @Pos=%ldmdeg err=%ldmdeg\r\n",
              (long)pos_mdeg, (long)err_mdeg);
+    }
+
+    /* ★ 2026-10-24: 定时轨迹的客观指标(原来是 ISR 里打印, 会把 LAW max 抬高 4us) */
+    {
+        int32_t tv = 0, iq = 0, band = 0, drive = 0;
+        if (FOC_App_TakeMoveStats(&tv, &iq, &band, &drive) != 0U) {
+            LOGD("[TM] done: max|tv|=%.1fdeg max|Iqref|=%.2fA | band=%.2fA drive=%.2fA%s\r\n",
+                 (double)((float)tv / 1000.0f),
+                 (double)((float)iq / 1000.0f),
+                 (double)((float)band / 1000.0f),
+                 (double)((float)drive / 1000.0f),
+                 (iq >= drive) ? "  <== DRIVE SATURATED" : "");
+        }
     }
 }
 

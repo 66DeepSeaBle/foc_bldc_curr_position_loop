@@ -451,6 +451,43 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
  *   读数只会落后、绝不虚前, 环路因此不会去修一个不存在的误差)。 */
 #define POS_MODEL_TAU_S   0.005f
 
+/* ==========================================================================
+ * ★★★ 2026-10-25 扇区内进角: 从"指数外推"改成"按预计到达时刻线性推进"
+ * --------------------------------------------------------------------------
+ * 置 0 = 完全回到旧行为(adv += pos_ext_w)。
+ *
+ * 旧做法的缺陷(实测定量, 20kHz):
+ *   pos_ext_w 每拍乘 (1-1/τf), τ=5ms=100 拍。而机械 750°/s 时一个电扇区
+ *   只要 ~206 拍 ⇒ 整个扇区里 pos_ext_w 衰减到 e^-2 = 0.135
+ *   ⇒ **adv 只能走完约 48% 的扇区** ⇒ 读数卡在扇区中段等霍尔边沿,
+ *      边沿一来就跳一大截。
+ *   实测证据: [TM] done 里 `tv` 反复出现**逐字节重复**的 -26.0°,
+ *   同时 `Pos=29.21` 精确重复 6 次、`adv` 已到钳位、`vsp/ob/vp` 三个
+ *   速度量全为 0 —— 就是"读数冻结在扇区出口"的现场。
+ *
+ * 新做法: 用上一扇区的实测拍数 t_exp = 2hw/|omega| 定时,
+ *   让 adv 从 -dir·hw 线性走到 +dir·hw, 正好在 t_exp 拍时到出口:
+ *       adv += (dir·hw − adv) / (t_exp − dt)
+ *   · dt=0 时增量 = 2hw/t_exp = |omega| ⇒ 与匀速完全一致
+ *   · 跟得上时全程斜率恒为 |omega| ⇒ 不再欠走
+ *   · 落后时(转子加速)增量变大 ⇒ 自动追赶
+ *   · **绝不会提前到出口** ⇒ 假平台最早也要等"预计该到出口"之后才可能出现
+ *   · dt ≥ t_exp(堵转/边沿迟到) → 回退旧外推 ⇒ 读数停在出口附近等边沿
+ *     (这正是尺绞时应有的行为, 不影响位置环判"没动")
+ *
+ * ⚠⚠ 2026-10-25 **实测回归, 已关闭(置 0)**。band=2.70 同一固件对比:
+ *      方向      旧(exp 外推)   新(t_exp 线性)      变化
+ *      0→360     25.5°          29.7°              +16%
+ *      360→0     27.0°          77.9°              +189%  ◀ 大幅变差
+ *   且新版本 0→360 每次运动 `jp`(位置跳变计数)累加到 10,
+ *   360→0 开头一次 `Pos` 就跳掉 ~38°(227701→227824 走 44° 而 vsp=-11)。
+ *   结论: adv 改成"按 t_exp 定时"后对 `obs->omega` 的**瞬时可信度**过度敏感
+ *   (方向反转分支/窗口估计把 omega 清零时, t_exp 无穷大 ⇒ adv 几乎不前进),
+ *   而旧版的"指数衰减 + 钳位"虽然走得慢但对 omega 噪声鲁棒。
+ *   除非重新设计(例如 t_exp 用 omega_filt 且加下限), 否则不要再开。
+ * ========================================================================== */
+#define POS_ADV_TIMED_RAMP   0
+
 float AngleObserver_GetTheta(Angle_Observer_t *obs, const Hall_State_t *hall,
                              uint32_t now_tick, float pwm_freq,
                              uint32_t timeout_ticks, float creep_hz,
@@ -561,8 +598,29 @@ float AngleObserver_GetTheta(Angle_Observer_t *obs, const Hall_State_t *hall,
            目标 45/90 恰好落在格点上所以能到位, 但看到的"过冲 15°"其实主要是
            越过边界后读数跳到下一个格点, 不是真的冲了 15°)。
            ★ 2026-10-11ac: 用**外推速度** pos_ext_w(按 τ 累积衰减), 不再用
-           omega_filt(那里存的是给环路看的速度, 不衰减)。 */
+           omega_filt(那里存的是给环路看的速度, 不衰减)。
+           ★★ 2026-10-25: 改为按"预计到达时刻"线性推进, 见 POS_ADV_TIMED_RAMP。 */
+#if POS_ADV_TIMED_RAMP
+        {
+            float hw   = obs->theta_halfwidth;
+            float wmag = fabsf(obs->omega);
+            float wdir = (hall->dir >= 0) ? 1.0f : -1.0f;
+
+            if (wmag > 1.0e-6f) {
+                float t_exp  = (2.0f * hw) / wmag;   /* 上一扇区的实测拍数 */
+                float t_left = t_exp - (float)dt;    /* 距“预计出口”还剩几拍 */
+                if ((t_left > 1.0f) && (t_left < (float)FOC_TICKS_PER_S)) {
+                    obs->adv += (wdir * hw - obs->adv) / t_left;
+                } else {
+                    obs->adv += obs->pos_ext_w;      /* 已到/过了预计时刻 */
+                }
+            } else {
+                obs->adv += obs->pos_ext_w;          /* 速度≈ 0: 保持旧行为 */
+            }
+        }
+#else
         obs->adv += obs->pos_ext_w;
+#endif
         /* 2026-10-01: 上报速度也用**限幅后**的 w。 原来用 obs->omega, 它在
            两个边沿之间是"冻结"的旧值 ⇒ 停转后 dt 越拉越长、物理上不可能
            还保持那个速度, 但 vsp 会一直显示旧值(实测停在 404 不动), 

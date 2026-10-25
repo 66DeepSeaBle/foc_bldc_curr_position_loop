@@ -3,6 +3,7 @@
   * @brief   FOC 控制核心: 状态机 + 电流/速度/位置环 + 定时轨迹
   */
 #include "foc_control.h"
+#include "foc_app.h"
 #include "transform.h"
 #include "pid.h"
 #include "sensor.h"      /* 位置传感器抽象: ALIGN 零点标定走 g_sensor(换编码器不用改这里) */
@@ -1208,6 +1209,22 @@ static float   s_tm_posobs      = 0.0f;
 static float   s_tm_dbg_verr    = 0.0f;   /* 日志: 轨迹位置误差(°) */
 static float   s_tm_dbg_ff      = 0.0f;   /* 日志: 摩擦前馈(A) */
 static float   s_tm_dbg_trim    = 0.0f;   /* 日志: 微调+阻尼(A) */
+/* ★ 2026-10-24: 单次轨迹的客观指标(峰值跟踪误差 / 峰值指令电流)。
+   用途: 比较“力矩档”是否真的改善了深齿槽滞后 —— 不需要翻长日志,
+   每跑完一段轨迹就打一行 [TM] done。 */
+static float   s_tm_max_tverr   = 0.0f;   /* max|参考−实际| (°) */
+static float   s_tm_max_iq      = 0.0f;   /* max|Iqref| (A) */
+static float   s_tm_max_drive   = 0.0f;   /* 本次轨迹用过的**最大**驱动侧上限(A)
+                                             2026-10-25: drive 现在是随 |verr| 变的,
+                                             只报末尾的瞬时值没意义; 报峰值才能
+                                             看出"到底有没有放开到 band"。 */
+/* 轨迹结束事件 —— ★ 不能直接在 ISR 里打日志: 实测会让那一拍的 LAW 从
+   12.9us 涨到 16.8us(vsnprintf + RTT)。所以只置标志, 由主循环打印。 */
+static uint8_t s_tm_done_evt    = 0U;
+static int32_t s_tm_done_tv     = 0;
+static int32_t s_tm_done_iq     = 0;
+static int32_t s_tm_done_band   = 0;
+static int32_t s_tm_done_drive  = 0;
 /* ★★ 2026-10-11al 60→150: 收尾段靠轨迹修正项把最后几度拉进来(见 POS_TM_DONE_DEG),
    60°/s 对 20° 的滞后要 0.35s 而且已经偏慢; 150°/s 仍低于齿槽擒住极限 195°/s。 */
 #define POS_TM_TRIM_MAX_DEG_S   150.0f   /* 跟踪修正项限幅(机械°/s) */
@@ -1584,6 +1601,130 @@ static float TM_Profile4(float t, float ta, float tc, float td, float tapp,
     return p;
 }
 
+/* ==========================================================================
+ * ★★★ 2026-10-24 运行时可调的「力矩档 / 速度档」(接口见 foc_app.h)
+ * --------------------------------------------------------------------------
+ * 做法: **保持原宏名不变**, 只把它们的值从编译期常量换成运行期变量
+ *       (`#undef` + 重新 `#define`), 下面几千行代码一个字都不用改。
+ *
+ * 默认 cap = 2.5A(= 原 POS_IQ_CAP_A) ⇒ 比例 r = 1.0 ⇒ **所有数值与改动前完全相同**,
+ * 所以这个改动本身是"零行为变化"的。
+ *
+ * 用户把力矩档调到 X A 时, 下面各项按 r = X/2.5 等比放大, 保持原有标定比例:
+ *     POS_IQ_CAP_A / POS_DAMP_MAX_A  (总上限 / 满刹车)
+ *     POS_TM_DAMP_MAX_A              (轨迹期阻尼项, 原 0.80 = 0.32·cap)
+ *     POS_TM_P_TRIM_MAX_A            (位置微调,     原 2.00 = 0.80·cap)
+ *     POS_KICK_A                     (破黏脉冲,     原 2.00 = 0.80·cap)
+ * ⚠ 故意**不**缩放(它们是"温柔/防冲过头"的柔性参数, 不是力矩上限):
+ *     POS_IQ_RUN_A(1.5) / POS_SOFT_IQ_A(1.30) / POS_SOFT_IQ_MAX_A(1.60) /
+ *     POS_INTEG_MAX_A(0.8)
+ *
+ * ⚠⚠ 2026-10-25 **POS_TM_IQ_DRIVE_MAX_A 已从上面的等比缩放里拿出来** ——
+ *   驱动侧上限现在是一个**绝对量**(基准 1.70A, 不随 band 变), 只在
+ *   "过了起步窗口 + 确实掉队"时才按掉队量线性放开到 band。
+ *   详见 POS_TM_DRIVE_GATE_TA / POS_TM_DRIVE_BOOST_DEG 的注释。
+ * ========================================================================== */
+/* ★★★ 2026-10-25 第②步: 驱动侧限流与"力矩档"**解耦** -------------------
+ * 旧写法: drive = 1.70 × (band/2.50) ⇒ band 放大 ⇒ 起步"踢出扇区"的净力矩同步
+ *   变大(净 = drive − 静摩擦 1.45A)。实测:
+ *     band 2.70 ⇒ drive 1.84 ⇒ 净 0.39A ⇒ 0→360 的 max|tv| = 25~30°
+ *     band 3.50 ⇒ drive 2.38 ⇒ 净 0.93A ⇒ 冲得更狠, tv 反而变差
+ *   而 band 缩小时 drive 又不够: band 1.50 ⇒ drive 1.02A ⇒ 深齿槽根本推不动,
+ *   实测 0.85s 的行程跑了 **5.2s**，中间 STICTION kick + CREEP 一路升到 1599mA。
+ *
+ * 新写法: ① 基准恒为 POS_TM_IQ_DRIVE_DEF_A(1.70A 绝对量, 不随 band 变);
+ *        ② 过了起步窗口(同摩擦前馈的 ta×1.5)且真的掉队(|verr| 大)时,
+ *           按掉队量**线性**放开到 band:
+ *              |verr| ≤ 10°   ⇒ 1.70A            (正常跟踪; 起步柔和)
+ *              |verr| = 22.5° ⇒ (1.70+band)/2   (band 2.70 ⇒ 2.20A)
+ *              |verr| ≥ 35°   ⇒ band            (真卡死 / F=ma 不够)
+ *        ③ 后面的限幅只管**驱动方向**(ts·s_tm_iq); 刹车方向仍由
+ *           POS_DAMP_MAX_A(= band) 限 ⇒ 放开驱动权限**不会削弱刹车**。
+ * 因为放开量是 |verr| 的连续函数(无滞后开关), 不会像"卡住就升/不卡就降"
+ * 那样退化成方波(那是 cal18/cal19 反复出错的根因)。
+ *
+ * ★ 2026-10-25 实测(band 3.30, 门 = ta×1.5 ≈ 285ms):
+ *     方向     max\|tv\|   max\|Iqref\|   max drive cap
+ *     0→360    25.5°        **1.70A**       2.69A
+ *     360→0    54.4/54.6°   **2.29A**       2.96A
+ *   ⇒ 两个结论:
+ *   ① **0→360 根本不是缺电流**: 环自己只要 1.70A, cap 放到 2.69 也没用上。
+ *      它的 25.5° 来自观测器/齿槽, 不是电流权限。
+ *   ② **360→0 是真的缺**: 它要 2.29A, band 2.70 时被 drive=1.84 卡住。
+ *      但起步窗口把前 285ms 钉在 1.70A ⇒ 误差一路冲到 54°(2.70 档时
+ *      固定 1.84A 只有 32~50°)。**这个时间门是负优化, 已置 0。**
+ *   verr 是"参考−实际"的**跟踪误差**, 起步时 ≈ 0、随着参考拉开才长大,
+ *   所以去掉时间门不会让起步变狠 —— 它天然就只在本环真的掉队后才放开。
+ * -------------------------------------------------------------------------- */
+#define POS_TM_DRIVE_GATE_TA      0.0f    /* 2026-10-25: 1.5 → 0(时间门取消) */
+#define POS_TM_DRIVE_BOOST_DEG   10.0f    /* 超过这个掉队量才开始放开 */
+#define POS_TM_DRIVE_BOOST_SPAN  25.0f    /* 再多这么多就放到满(band) */
+
+/* 改动前的原始常量(作为运行期缩放的基准, 不要再改) */
+#define POS_IQ_CAP_DEF_A        2.5f
+#define POS_TM_IQ_DRIVE_DEF_A   1.70f
+#define POS_TM_DAMP_DEF_A       0.80f
+#define POS_TM_P_TRIM_DEF_A     2.00f
+#define POS_KICK_DEF_A          2.0f
+#define POS_VMAX_DEF_DEG_S      800.0f
+#define POS_ACC_DEF_DEG_S2      8000.0f
+
+static float s_iq_cap_a      = POS_IQ_CAP_DEF_A;      /* 总电流上限(A) */
+static float s_iq_drive_cap  = POS_TM_IQ_DRIVE_DEF_A; /* 轨迹期驱动侧上限(A) */
+static float s_tm_damp_cap   = POS_TM_DAMP_DEF_A;     /* 轨迹期阻尼项上限(A) */
+static float s_trim_cap      = POS_TM_P_TRIM_DEF_A;   /* 位置微调上限(A) */
+static float s_kick_cap      = POS_KICK_DEF_A;        /* 破黏脉冲电流(A) */
+static float s_vmax_deg_s    = POS_VMAX_DEF_DEG_S;    /* 巡航速度上限(机械°/s) */
+static float s_accmax_deg_s2 = POS_ACC_DEF_DEG_S2;    /* 峰值加速度上限(°/s²) */
+
+#undef  POS_IQ_CAP_A
+#define POS_IQ_CAP_A            (s_iq_cap_a)
+#undef  POS_DAMP_MAX_A
+#define POS_DAMP_MAX_A          (s_iq_cap_a)
+#undef  POS_TM_IQ_DRIVE_MAX_A
+#define POS_TM_IQ_DRIVE_MAX_A   (s_iq_drive_cap)
+#undef  POS_TM_DAMP_MAX_A
+#define POS_TM_DAMP_MAX_A       (s_tm_damp_cap)
+#undef  POS_TM_P_TRIM_MAX_A
+#define POS_TM_P_TRIM_MAX_A     (s_trim_cap)
+#undef  POS_KICK_A
+#define POS_KICK_A              (s_kick_cap)
+#undef  POS_TM_VMAX_MECH_DEG_S
+#define POS_TM_VMAX_MECH_DEG_S  (s_vmax_deg_s)
+#undef  POS_TM_ACC_MAX_DEG_S2
+#define POS_TM_ACC_MAX_DEG_S2   (s_accmax_deg_s2)
+
+static void FOC_App_SetIqCap(float cap)
+{
+    float r;
+
+    if (!(cap > FOC_APP_TORQUE_MIN_A)) { cap = FOC_APP_TORQUE_MIN_A; }
+    if (cap > FOC_APP_TORQUE_MAX_A)    { cap = FOC_APP_TORQUE_MAX_A; }
+
+    r = cap / POS_IQ_CAP_DEF_A;
+    s_iq_cap_a     = cap;
+    /* ★ 2026-10-25: 驱动侧上限**不随 band 缩放**(绝对量 1.70A)。
+       它在轨迹里每拍按 |verr| 重新算, 这里只给个初值。 */
+    s_iq_drive_cap = POS_TM_IQ_DRIVE_DEF_A;
+    s_tm_damp_cap  = POS_TM_DAMP_DEF_A     * r;
+    s_trim_cap     = POS_TM_P_TRIM_DEF_A   * r;
+    s_kick_cap     = POS_KICK_DEF_A        * r;
+}
+
+static void FOC_App_SetSpeedInt(float deg_s)
+{
+    if (!(deg_s > FOC_APP_SPEED_MIN_DEG_S)) { deg_s = FOC_APP_SPEED_MIN_DEG_S; }
+    if (deg_s > FOC_APP_SPEED_MAX_DEG_S)    { deg_s = FOC_APP_SPEED_MAX_DEG_S; }
+
+    s_vmax_deg_s = deg_s;
+    /* 加速度上限跟着速度走: 否则低速档时"加速度/巡航速度"比例失衡,
+       短行程会退化成"几乎全程在加速"。
+       默认 360°/s → 8000°/s²(与改动前完全一致)。 */
+    s_accmax_deg_s2 = deg_s * (POS_ACC_DEF_DEG_S2 / FOC_APP_SPEED_DEF_DEG_S);
+    if (s_accmax_deg_s2 < 500.0f)   { s_accmax_deg_s2 = 500.0f; }
+    if (s_accmax_deg_s2 > 40000.0f) { s_accmax_deg_s2 = 40000.0f; }
+}
+
 static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
 {
     float erpm_now;
@@ -1921,6 +2062,20 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                 if ((done != 0U) || (t > (Tm + 0.60f))) {
                     s_tm_active = 0U;
                     s_tm_phase  = 0U;
+                    /* ★ 2026-10-24: 只置事件, 由主循环打印(见 s_tm_done_evt 注释)。
+                       用来看“力矩档”是否真的改善了深齿槽滞后。 */
+                    s_tm_done_tv    = (int32_t)(s_tm_max_tverr * 1000.0f);
+                    s_tm_done_iq    = (int32_t)(s_tm_max_iq * 1000.0f);
+                    s_tm_done_band  = (int32_t)(s_iq_cap_a * 1000.0f);
+                    s_tm_done_drive = (int32_t)(s_tm_max_drive * 1000.0f);
+                    s_tm_done_evt   = 1U;
+                    s_tm_max_tverr = 0.0f;
+                    s_tm_max_iq    = 0.0f;
+                    s_tm_max_drive = 0.0f;
+                    /* 诊断量清零: 不清的话 hold 时一直挂着上次轨迹的 tv/ff/tr */
+                    s_tm_dbg_verr = 0.0f;
+                    s_tm_dbg_ff   = 0.0f;
+                    s_tm_dbg_trim = 0.0f;
                 }
             }
         }
@@ -2209,16 +2364,34 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                         s_tm_iq = iq_f + POS_TM_A_PER_DEG_S2 * a_eff + trim + damp;
                         if (s_tm_iq >  POS_DAMP_MAX_A) s_tm_iq =  POS_DAMP_MAX_A;
                         if (s_tm_iq < -POS_DAMP_MAX_A) s_tm_iq = -POS_DAMP_MAX_A;
-                        /* ④ 驱动侧限流(2026-10-11ap): 见 POS_TM_IQ_DRIVE_MAX_A */
+                        /* ④ 驱动侧限流: 基准 1.70A 固定 + 掉队时线性放开到 band,
+                           见 POS_TM_DRIVE_GATE_TA / POS_TM_DRIVE_BOOST_DEG 注释 */
                         {
-                            float ts = (float)s_tm_sgn;
-                            if (ts * s_tm_iq > POS_TM_IQ_DRIVE_MAX_A) {
-                                s_tm_iq = ts * POS_TM_IQ_DRIVE_MAX_A;
+                            float cap = POS_TM_IQ_DRIVE_DEF_A;
+                            if (t > (ta * POS_TM_DRIVE_GATE_TA)) {
+                                float e = fabsf(verr);
+                                if (e > POS_TM_DRIVE_BOOST_DEG) {
+                                    float k = (e - POS_TM_DRIVE_BOOST_DEG)
+                                            / POS_TM_DRIVE_BOOST_SPAN;
+                                    if (k > 1.0f) k = 1.0f;
+                                    cap += (s_iq_cap_a - POS_TM_IQ_DRIVE_DEF_A) * k;
+                                }
                             }
+                            if (cap < POS_TM_IQ_DRIVE_DEF_A) cap = POS_TM_IQ_DRIVE_DEF_A;
+                            if (cap > s_iq_cap_a)           cap = s_iq_cap_a;
+                            s_iq_drive_cap = cap;
+                            if (cap > s_tm_max_drive) { s_tm_max_drive = cap; }
+                            {   float ts = (float)s_tm_sgn;
+                                if (ts * s_tm_iq > cap) {
+                                    s_tm_iq = ts * cap;
+                                } }
                         }
                         s_tm_dbg_verr = verr;
                         s_tm_dbg_ff   = iq_f;
                         s_tm_dbg_trim = trim + damp;
+                        /* ★ 2026-10-24: 单次轨迹的峰值指标 */
+                        if (fabsf(verr) > s_tm_max_tverr) { s_tm_max_tverr = fabsf(verr); }
+                        if (fabsf(s_tm_iq) > s_tm_max_iq)  { s_tm_max_iq = fabsf(s_tm_iq); }
                         /* ⑤ 速度观测器更新(用刚算出的指令电流作为模型输入)
                            ★★★ cal18: 模型输入必须是"**真正产生加速度的那部分**
                            电流", 也就是 `s_tm_iq - iq_f`。原来减的是
@@ -3460,6 +3633,9 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
     s_tm_dbg_verr    = 0.0f;   /* 轨迹诊断清零: 免得上一轮的残留值误导日志 */
     s_tm_dbg_ff      = 0.0f;
     s_tm_dbg_trim    = 0.0f;
+    s_tm_max_tverr   = 0.0f;   /* ★ 本次轨迹的峰值指标 */
+    s_tm_max_iq      = 0.0f;
+    s_tm_max_drive   = POS_TM_IQ_DRIVE_DEF_A;
     LOGD("[TM] %.1f -> %.1fdeg (D=%.1f) in %.2fs | accel %.2fs + cruise %.2fs + decel %.2fs + creep %.2fs | v_cruise=%.1f -> v_app=%.1f deg/s\r\n",
          pos0, foc->pos_target_deg_cmd, D, T,
          T * POS_TM_TA_FRAC, T * POS_TM_TC_FRAC, T * POS_TM_TD_FRAC,
@@ -3602,4 +3778,167 @@ uint8_t FOC_Control_IsFault(const FOC_Control_t *foc)
 {
     return foc->flags.fault;
 }
+
+/* ==========================================================================
+ * ★★★ 2026-10-24 应用层接口实现(声明/说明见 foc_app.h)
+ * --------------------------------------------------------------------------
+ * 三层结构, 上层只需要最上面那三个:
+ *   ① FOC_App_SetTuning()  设「力矩档 + 速度档」
+ *   ② FOC_App_MoveTo()     发一条移动命令
+ *   ③ FOC_App_GetHw()      读硬件链路实测参数(运放增益/量程/分辨率)
+ * ========================================================================== */
+static FOC_Control_t *s_app_foc = 0;
+
+void FOC_App_Init(FOC_Control_t *foc)
+{
+    s_app_foc = foc;
+
+    /* 回到默认档 —— 与改动前完全一致的数值 */
+    FOC_App_SetIqCap(FOC_APP_TORQUE_DEF_A);
+    FOC_App_SetSpeedInt(FOC_APP_SPEED_DEF_DEG_S);
+}
+
+uint8_t FOC_App_SetTuning(const FOC_AppTuning_t *cfg)
+{
+    if ((cfg == 0) || (s_app_foc == 0)) { return 0U; }
+
+    if (cfg->torque_a > 0.0f)    { FOC_App_SetIqCap((float)cfg->torque_a); }
+    if (cfg->speed_deg_s > 0.0f) { FOC_App_SetSpeedInt((float)cfg->speed_deg_s); }
+    return 1U;
+}
+
+void FOC_App_GetTuning(FOC_AppTuning_t *out)
+{
+    if (out == 0) { return; }
+    out->torque_a    = s_iq_cap_a;
+    out->speed_deg_s = s_vmax_deg_s;
+}
+
+void FOC_App_SetTorque(float amp)  { FOC_App_SetIqCap(amp); }
+float FOC_App_GetTorque(void)      { return s_iq_cap_a; }
+void FOC_App_SetSpeed(float deg_s) { FOC_App_SetSpeedInt(deg_s); }
+float FOC_App_GetSpeed(void)       { return s_vmax_deg_s; }
+
+float FOC_App_GetIqLimitDrive(void) { return s_iq_drive_cap; }
+float FOC_App_GetIqLimitTrim(void)  { return s_trim_cap; }
+float FOC_App_GetIqLimitDamp(void)  { return s_tm_damp_cap; }
+float FOC_App_GetIqLimitKick(void)  { return s_kick_cap; }
+
+/* 取走上一段定时轨迹的客观指标(主循环调, 读即清)。
+   返回 1 = 有新数据。单位: 0.001° / 0.001A */
+uint8_t FOC_App_TakeMoveStats(int32_t *max_tv_mdeg, int32_t *max_iq_ma,
+                              int32_t *band_ma, int32_t *drive_ma)
+{
+    uint8_t ev;
+
+    __disable_irq();
+    ev = s_tm_done_evt;
+    s_tm_done_evt = 0U;
+    if (max_tv_mdeg != 0) { *max_tv_mdeg = s_tm_done_tv; }
+    if (max_iq_ma    != 0) { *max_iq_ma    = s_tm_done_iq; }
+    if (band_ma      != 0) { *band_ma      = s_tm_done_band; }
+    if (drive_ma     != 0) { *drive_ma     = s_tm_done_drive; }
+    __enable_irq();
+    return ev;
+}
+
+/* 按「行程 + 速度」反算总时长。
+   4 段轨迹(加速2/9 + 匀速3/9 + 减速2/9 + 逼近2/9)的巡航速度满足
+       vc ≈ 1.8 × 行程 / 总时长
+   ⇒ 总时长 T = 1.8 × 行程 / 速度; 再与"加速度上限"给出的最短用时取大。
+   若给定速度 > 速度档, 用速度档(避免超出机械/齿槽能力)。 */
+float FOC_App_EstimateTime(float dist_deg, float speed_deg_s)
+{
+    float D = fabsf(dist_deg);
+    float v = (speed_deg_s > 0.0f) ? speed_deg_s : s_vmax_deg_s;
+    float T, Tmin_a;
+
+    if (D < 1.0f) { return 0.0f; }          /* 已在目标上 */
+    if (v < 1.0f) { v = 1.0f; }
+    if (v > s_vmax_deg_s) { v = s_vmax_deg_s; }
+
+    T      = 1.8f * D / v;
+    Tmin_a = sqrtf(12.7f * D / s_accmax_deg_s2);
+    if (T < Tmin_a) { T = Tmin_a; }
+    if (T < 0.20f)  { T = 0.20f; }          /* 再短就没有意义了 */
+    return T;
+}
+
+uint8_t FOC_App_MoveTo(float target_deg, float speed_deg_s, float dur_s)
+{
+    float vmax_saved, acc_saved;
+    float pos0, D, T;
+
+    if (s_app_foc == 0) { return 0U; }
+    if (!((target_deg > -100000.0f) && (target_deg < 100000.0f))) { return 0U; }
+
+    vmax_saved = s_vmax_deg_s;
+    acc_saved  = s_accmax_deg_s2;
+    if (speed_deg_s > 0.0f) {
+        FOC_App_SetSpeedInt((float)speed_deg_s);   /* 本动临时改速度档 */
+    }
+
+    if (dur_s > 0.0f) {
+        /* 给了时长 ⇒ 时长优先(与原 `t<deg> d<sec>` 语义一致) */
+        FOC_Control_SetTimedTarget(s_app_foc, target_deg, dur_s);
+    } else {
+        pos0 = AngleObserver_GetMechDeg(&s_app_foc->angle,
+                                        s_app_foc->config.pole_pairs);
+        D = fabsf(target_deg - pos0);
+        T = FOC_App_EstimateTime(D, 0.0f);          /* 用当前速度档 */
+        if (T <= 0.0f) {
+            /* 读数上已经在目标上 ⇒ 仍然设目标(交给普通律去微调/保持),
+               但返回 0 让上层知道"没有启动一段轨迹"。 */
+            FOC_Control_SetPosTarget(s_app_foc, target_deg);
+            s_vmax_deg_s    = vmax_saved;
+            s_accmax_deg_s2 = acc_saved;
+            return 0U;
+        }
+        FOC_Control_SetTimedTarget(s_app_foc, target_deg, T);
+    }
+
+    s_vmax_deg_s    = vmax_saved;                    /* 恢复速度档 */
+    s_accmax_deg_s2 = acc_saved;
+
+    /* 一键启动: 不在闭环里就自动走一次 ALIGN(与 app 层 AutoStartIfIdle 一致) */
+    if ((s_app_foc->state == FOC_STATE_IDLE) ||
+        (s_app_foc->state == FOC_STATE_FAULT)) {
+        s_app_foc->flags.fault   = 0U;
+        s_app_foc->fault_code    = 0U;
+        s_app_foc->flags.enabled = 1U;
+        s_app_foc->align_tick    = 0U;
+        s_app_foc->startup_tick  = 0U;
+        FOC_Control_SetState(s_app_foc, FOC_STATE_ALIGN);
+    }
+    return 1U;
+}
+
+void FOC_App_GetHw(uint16_t zero_counts, FOC_AppHw_t *out)
+{
+    float shunt, gain, vref, res, v_per_a, v_zero;
+
+    if (out == 0) { return; }
+    if (s_app_foc == 0) { return; }
+
+    shunt = s_app_foc->config.shunt_r;
+    gain  = s_app_foc->config.op_gain;
+    vref  = s_app_foc->config.vref;
+    res   = (float)s_app_foc->config.adc_resolution;
+
+    v_per_a = shunt * gain;              /* V/A */
+    if (v_per_a < 1.0e-6f) { v_per_a = 1.0e-6f; }
+    v_zero  = ((float)zero_counts) * vref / (res - 1.0f);
+
+    out->shunt_ohm = shunt;
+    out->amp_gain  = gain;
+    out->v_per_a   = v_per_a;
+    out->a_per_lsb = vref / (res - 1.0f) / v_per_a;
+    out->v_zero    = v_zero;
+    /* 运放输出可摆到接近 0V 和接近 Vref(轨到轨), 所以:
+         正方向可测 = (Vref − V_zero) / (V/A)
+         负方向可测 =  V_zero        / (V/A)            */
+    out->range_neg_a = v_zero / v_per_a;
+    out->range_pos_a = (vref - v_zero) / v_per_a;
+}
+
 
