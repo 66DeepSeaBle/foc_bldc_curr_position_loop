@@ -7,11 +7,14 @@
 
 #include "foc_types.h"
 
-/* ---- ??? ---- */
+/* ---- 初始化 ----
+   hall_offset_deg : 霍尔零点偏移(deg); 一般给 0, 由 ALIGN 结束后的
+                     AngleObserver_CalibrateOffsetAtZero() 自动标定。
+   hall_dir_rev    : 1 = 霍尔扇区顺序反转(对应 board_config.h 的 CFG_HALL_DIR_REV)。 */
 void AngleObserver_Init(Angle_Observer_t *obs, float hall_offset_deg,
                         uint8_t hall_dir_rev);
 
-/* ---- ??:?????????? ---- */
+/* ---- 处理一条边沿(低层入口, 不做相邻性校验) ---- */
 void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
                               uint32_t now_tick, float pwm_freq,
                               float min_dt_ticks, float omega_clamp_erpm,
@@ -25,19 +28,23 @@ uint8_t AngleObserver_PollHall(Angle_Observer_t *obs, Hall_State_t *hall,
                                float min_dt_ticks, float omega_clamp_erpm,
                                float alpha_max);
 
-/* ---- ??????:???PWM???? ---- */
+/* ---- 取电角度(rad), erpm_out 可选输出转速 ----
+   每个 PWM 周期调一次。返回值 = 扇区中心角 + 扇区内进角(adv) + 零点偏移。
+   无新边沿时靠模型外推推进 adv, 并按 POS_MODEL_TAU_S 衰减(停转后不会自己爬)。
+   creep_hz / creep_suppress 用来在极低速时限制外推速度。 */
 float AngleObserver_GetTheta(Angle_Observer_t *obs, const Hall_State_t *hall,
                              uint32_t now_tick, float pwm_freq,
                              uint32_t timeout_ticks, float creep_hz,
                              uint8_t creep_suppress, float *erpm_out);
 
-/* ---- ?????? (eRPM) ---- */
+/* ---- 读转速(eRPM), 未滤波 ---- */
 float AngleObserver_GetOmegaErpm(const Angle_Observer_t *obs, float pwm_freq);
 
-/* ---- ???????? (eRPM) ---- */
+/* ---- 读转速(eRPM), 已滤波(带宽给控制环用) ---- */
 float AngleObserver_GetOmegaFiltErpm(const Angle_Observer_t *obs, float pwm_freq);
 
-/* ---- ??机械角度 (deg, 多圈累加) ---- */
+/* ---- 真实机械角度 (deg, 多圈) ----
+   = 相位展开后的连续电角度 / 极对数。停转时增量恒为 0 ⇒ 不会漂移。 */
 float AngleObserver_GetMechDeg(const Angle_Observer_t *obs, float pole_pairs);
 
 /* ---- 把当前位置定为 0(ALIGN/STARTUP 交接时用) ----
@@ -53,7 +60,8 @@ void AngleObserver_ZeroPos(Angle_Observer_t *obs);
    表现为走得动但一冲一停、静摩擦大处彻底卡死、空载也不转. */
 void AngleObserver_CalibrateOffsetAtZero(Angle_Observer_t *obs, uint8_t hall_state);
 
-/* ---- ???? ---- */
+/* ---- 直接设霍尔零点偏移(deg) ----
+   平时由 AngleObserver_CalibrateOffsetAtZero() 自动标定, 这个只在手动调试时用。 */
 void AngleObserver_SetOffset(Angle_Observer_t *obs, float offset_deg);
 
 #endif

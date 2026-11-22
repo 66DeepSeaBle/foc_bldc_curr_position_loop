@@ -37,7 +37,7 @@ float SpeedLoop_Update(SpeedLoop_t *loop,
 
     loop->tick = now_tick;
 
-    /* ?????? */
+    /* 指令斜坡: 每拍最多走 ramp_rate×dt, 防止 Iq 指令阶跃 */
     if (loop->ramp_rate > 0.0f) {
         float step = loop->ramp_rate * dt_s;
         if (loop->ref_erpm < ref_erpm) {
@@ -53,7 +53,8 @@ float SpeedLoop_Update(SpeedLoop_t *loop,
 
     loop->erpm_now = erpm_now;
 
-    /* ---- ???? ---- */
+    /* ---- 稳定判定: 误差持续小于门限超 settle_ms ⇒ 降到 iq_max_normal ----
+       (运动中用 iq_max_zone 保证动力, 稳住后降限幅减小嗡嗡声与发热) */
     err = loop->ref_erpm - erpm_now;
     if (fabsf(err) < loop->settle_err_erpm) {
         if (loop->settled_tick == 0) loop->settled_tick = now_tick;
@@ -114,6 +115,8 @@ float SpeedLoop_GetIqCap(const SpeedLoop_t *loop)
 void SpeedLoop_OverrideIqCap(SpeedLoop_t *loop, float cap)
 {
     (void)loop;
-    /* ??????? loop->iq_cap ???????? */
+    (void)cap;
+    /* ⚠ 空实现占位: 历史遗留, 当前不改变任何状态。
+       需要临时改限幅请直接写 loop->iq_cap 或改 iq_max_zone。 */
 }
 

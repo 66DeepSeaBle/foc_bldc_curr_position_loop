@@ -1,13 +1,15 @@
 /**
   * @file    transform.h
-  * @brief   Clarke/Park/?Park?? ??
+  * @brief   Clarke / Park / 逆Park / 逆Clarke 变换 + 三角函数查表
   */
 #ifndef TRANSFORM_H
 #define TRANSFORM_H
 
 #include "foc_types.h"
 
-/* ---- Clarke??: Iu,Iv,Iw -> Ialpha,Ibeta ---- */
+/* ---- Clarke 变换: Iu,Iv,Iw -> Ialpha,Ibeta ----
+   只用 u/v 两相(三相和恒为 0, w 由 -u-v 推出), 所以 iw 参数未使用。
+   采用等幅值 Clarke(系数 2/3), 与逆变换配合保持幅值不变。 */
 void Clarke_Transform(float iu, float iv, float iw, float *ialpha, float *ibeta);
 
 /* ==========================================================================
@@ -28,15 +30,15 @@ void FOC_SinCos(float th, float *s, float *c);
 float FOC_Sin(float th);
 float FOC_Cos(float th);
 
-/* ---- Park??: Ialpha,Ibeta,theta -> Id,Iq ---- */
+/* ---- Park 变换: Ialpha,Ibeta,theta -> Id,Iq ---- */
 void Park_Transform(float ialpha, float ibeta, float theta,
                     float *id, float *iq);
 
-/* ---- ?Park??: Vd,Vq,theta -> Valpha,Vbeta ---- */
+/* ---- 逆 Park 变换: Vd,Vq,theta -> Valpha,Vbeta ---- */
 void InvPark_Transform(float vd, float vq, float theta,
                        float *valpha, float *vbeta);
 
-/* ---- ????: Valpha,Vbeta -> Va,Vb,Vc ---- */
+/* ---- 逆 Clarke 变换: Valpha,Vbeta -> Va,Vb,Vc ---- */
 void InvClarke_Transform(float valpha, float vbeta, float *va, float *vb, float *vc);
 
 #endif

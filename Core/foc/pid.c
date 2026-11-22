@@ -28,14 +28,14 @@ float PID_Update(PID_Controller_t *pid, float err, float dt_s)
     float d_err;
     float out_unsat;
 
-    /* ?? (?dt??) */
+    /* 微分项(用 dt 求导; dt 非法时置 0 而不是除 0) */
     if (dt_s > 1e-6f) {
         d_err = (err - pid->prev_err) / dt_s;
     } else {
         d_err = 0.0f;
     }
 
-    /* ???? (???) + 条件积分(抗饱和)
+    /* 先算"未限幅"输出(比例+积分+微分), 再做条件积分(抗饱和)
        输出已饱和且误差仍指向饱和方向时停止积分. 否则积分会一路冲到限幅并
        锁死: 实测 ALIGN 期间 id_ref=3A 而 id 冲到 7.2A(vd/vq 双双顶到 ±0.45),
        相位电流超过 6A 过流门限 → 直接进 FAULT. */
@@ -59,7 +59,7 @@ float PID_Update(PID_Controller_t *pid, float err, float dt_s)
 
     out = pid->kp * err + pid->integ + pid->kd * d_err;
 
-    /* ???? */
+    /* 输出限幅 */
     if (out >  pid->lim) out =  pid->lim;
     if (out < -pid->lim) out = -pid->lim;
 
@@ -67,7 +67,7 @@ float PID_Update(PID_Controller_t *pid, float err, float dt_s)
     return out;
 }
 
-/* ---- ????? ---- */
+/* ---- 一阶低通滤波器 ---- */
 void LPF_Init(LowPassFilter_t *lpf, float tau_s)
 {
     lpf->y_prev = 0.0f;

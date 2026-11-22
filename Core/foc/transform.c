@@ -89,7 +89,9 @@ float FOC_Cos(float th)
 
 void Clarke_Transform(float iu, float iv, float iw, float *ialpha, float *ibeta)
 {
-    (void)iw;  // ????????????
+    /* 只用 u/v 两相: 星形接法无中线 ⇒ iu+iv+iw ≡ 0, 第三相是冗余的。
+       保留 iw 形参是为了接口一致(调用方手里正好有), 不参与计算。 */
+    (void)iw;
     *ialpha = iu;
     *ibeta = (iu + 2.0f * iv) * 0.57735027f;  // 1/v3
 }

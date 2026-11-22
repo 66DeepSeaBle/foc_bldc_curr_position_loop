@@ -205,7 +205,7 @@ static float s_erpm_filt = 0.0f;
 /* 手动模式的持续大电流计数(见 OL_MAN_TRIP_*) */
 static uint32_t s_man_oc_cnt = 0;
 
-/* ---- ??? ---- */
+/* ---- 初始化: 装配置 + 清全部状态 + 初始化四个环 ---- */
 void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
 {
     foc->config = *config;
@@ -250,7 +250,7 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
     foc->startup_tick = 0;
     foc->startup_omega = 0.0f;
 
-    /* ??????? */
+    /* 清霍尔状态 */
     foc->hall.u = 0;
     foc->hall.v = 0;
     foc->hall.w = 0;
@@ -260,11 +260,11 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
     foc->hall.prev_dt = 0;
     foc->hall.dir = 1;
 
-    /* ???????? */
+    /* 角度观测器(扇区表/测速/外推状态都在 foc->angle 里) */
     AngleObserver_Init(&foc->angle, config->hall_offset_deg,
                        config->hall_dir_rev);
 
-    /* ??????
+    /* 电流环参数
        kp/ki 单位 = duty/A 与 duty/(A·s)(vd/vq 直接就是占空比量, 见 SVPWM).
        按实测硬件(母线 24V, 相电阻 0.3Ω)标定: 被控对象直流增益
        K = Vbus/R ≈ 80 A/duty, 故环路增益 = kp*K 必须 ≲1 才稳定.
@@ -275,7 +275,7 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
        约 0.2s 补足静差; 积分零点 ki/kp=30rad/s 远低于电流环带宽, 不会振). */
     CurrentLoop_Init(&foc->current_loop, 0.010f, 0.300f, 0.45f, 0.0f, 0.0f);
 
-    /* ??????
+    /* 速度环参数
        ki 原来 0.20 太大: 霍尔边沿任何时候都可能给出几百~上千 eRPM 的瞬时值,
        ki*err 能到几十~几百/s, 积分在 0.1s 内就从 +1.5 打到 -1.5 = 满力矩反拉,
        于是"冲一下→被打回→再冲"的快速左右摆. 位置环转速尺度提上来后(见下),
@@ -289,7 +289,7 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
     SpeedLoop_Init(&foc->speed_loop, 0.004f, 0.02f,
                    0.5f, 1.2f, 10.0f, 200U, 1000.0f);
 
-    /* ??????
+    /* 位置环参数
        kp=0.3 eRPM/deg 太小: 45° 误差只给 13.5 eRPM(≈2.5°/s), 而霍尔瞬时速度
        是几百~上千 eRPM, 差 100 倍以上 → 速度环永远处于 bang-bang.
        提到 4.0: 45° → 180 eRPM(≈42°/s, 约 1.1s 到位), 与实际速度同量级;
@@ -311,10 +311,10 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
                       6.0f, 500U,
                       500.0f, config->pole_pairs);
 
-    /* ???PWM */
+    /* SVPWM 输出(顺便把死区补偿量算出来) */
     PWM_Output_Init(&foc->pwm, config->pwm_freq, config->deadtime_ns);
 
-    /* ???? */
+    /* 测量值清零 */
     foc->current.u = 0.0f;
     foc->current.v = 0.0f;
     foc->current.w = 0.0f;
@@ -362,7 +362,9 @@ void FOC_Control_Init(FOC_Control_t *foc, const FOC_Config_t *config)
     foc->ol_saved_torque = 1;
 }
 
-/* ---- ???? ---- */
+/* ---- 20kHz 主入口: 过流保护 + 状态机分发 ----
+   每个 PWM 周期调一次(由 App_OnCurrentSample 调), dt_s = 1/pwm_freq。
+   ⚠ 本函数不含测量, 电流/角度必须已被调用方算好。 */
 void FOC_Control_Run(FOC_Control_t *foc, float dt_s)
 {
     /* 过流检查: 只在三相输出真正使能驱动时才判断; IDLE/制动/故障或刚切到
@@ -427,7 +429,7 @@ void FOC_Control_Run(FOC_Control_t *foc, float dt_s)
     }
 }
 
-/* ---- ??????? ---- */
+/* ---- 各状态的具体实现 ---- */
 
 static void FOC_DoIdle(FOC_Control_t *foc)
 {
@@ -439,7 +441,7 @@ static void FOC_DoIdle(FOC_Control_t *foc)
 
 static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
 {
-    /* ????:??theta=0,?Id?? */
+    /* 对齐: 强制 theta=0, 注入 Id 把转子拉到已知位置 */
     const float align_current = foc->config.align_current;
     const uint32_t align_ms = 1500;
     uint32_t elapsed = foc->tick - foc->align_tick;
@@ -455,6 +457,8 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
     }
 
     elapsed = foc->tick - foc->align_tick;
+    /* 对齐分两步: 前 600 拍(30ms)矢量先停在 90° 电角度, 之后才转到 0°。
+       两步比一步更容易把转子从齿槽谷里拨出来, 对齐成功率明显更高。 */
     if (elapsed < 600) {
         theta_align = 1.57079633f;  // 90� ???
     } else {
@@ -463,7 +467,7 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
 
     foc->angle.theta = theta_align;
 
-    /* ????? */
+    /* 出到功率级(电流环 → SVPWM → TIM1) */
     FOC_UpdateCurrent(foc);
 
     if (elapsed > align_ms * FOC_TICKS_PER_MS) {
@@ -510,7 +514,7 @@ static void FOC_DoAlign(FOC_Control_t *foc, float dt_s)
 
 static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
 {
-    /* I-F??:??????,???? */
+    /* I-F 开环强拖: 角度自己走, q 轴电流恒定, 等霍尔同步 */
     const float target_hz = foc->config.startup_hz;
     const uint32_t startup_ms = 2500;
     const uint32_t max_ms = 6000;
@@ -525,7 +529,7 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
 
     elapsed = foc->tick - foc->startup_tick;
 
-    /* ??????? */
+    /* 转速斜坡: startup_ms 内从 0 线性升到 target_hz, 之后保持匀速 */
     if (elapsed < startup_ms * FOC_TICKS_PER_MS) {
         omega_target = 2.0f * 3.14159265f * target_hz / foc->config.pwm_freq *
                        (float)elapsed / (float)(startup_ms * FOC_TICKS_PER_MS);
@@ -544,7 +548,7 @@ static void FOC_DoStartup(FOC_Control_t *foc, float dt_s)
     foc->current_loop.iq_ref = foc->config.startup_current;
     FOC_UpdateCurrent(foc);
 
-    /* ???????? */
+    /* 同步判据: 已同步 + 霍尔扇区合法 + 已拖过 0.3s + 转速>8eRPM ⇒ 交接给闭环 */
     erpm = AngleObserver_GetOmegaFiltErpm(&foc->angle, foc->config.pwm_freq);
     /* 同步到就尽早交接(>0.3s 且已有转速), 并把开环拖转累积的巨大机械行程清零,
        否则目标0/45/90 要追几千度 → 永远顶/振/跑飞, 无法调闭环.
@@ -615,7 +619,7 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
 
     FOC_UpdateAngle(foc, &erpm_now);
 
-    /* ????? */
+    /* 速度反馈低通(τ≈100ms): 霍尔瞬时值每拍可跳几百 eRPM, 不滤会把速度环推成 bang-bang */
     s_erpm_filt += 0.0005f * (erpm_now - s_erpm_filt);
     iq_target = SpeedLoop_Update(&foc->speed_loop,
                                  s_erpm_filt,
@@ -623,11 +627,11 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
                                  dt_s,
                                  foc->tick);
 
-    /* ????? */
+    /* 把速度环的输出交给电流环(d 轴恒为 0 ⇒ 全部电流用来出力矩) */
     foc->current_loop.id_ref = 0.0f;
     foc->current_loop.iq_ref = iq_target;
 
-    /* ???? */
+    /* 出到功率级(电流环 → SVPWM → TIM1) */
     FOC_UpdateCurrent(foc);
 }
 
@@ -1845,7 +1849,8 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         s_pos_kick_fail    = 0U;
         LOGD("[POS] BLOCK retry: allowing pushes again\r\n");
     }
-    /* ??????? */
+    /* ---- PRE 段(每拍): 角度更新 ----
+       Park 变换用的电角度必须每拍都新, 否则电流矢量会滞后一个分频周期。 */
     {
         uint32_t at0 = DWT->CYCCNT;      /* ★ 角度更新单独计时(ANG) */
         FOC_UpdateAngle(foc, &erpm_now);
@@ -1896,7 +1901,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         }
     }
 
-    /* ????? */
+    /* 位置环(只用于诊断/到位判定) */
     /* 只保留它维护 pos_err_deg / arrived(供显示与到位判断); 速度指令不再使用 */
     (void)PositionLoop_Update(&foc->position_loop,
                               pos_now_deg,
@@ -2999,7 +3004,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         }
     }
 
-    /* ????? */
+    /* 指令兜底 + 大阶跃预置积分 + 下发 */
     /* ★10-11k 兜底: 任何非有限/离谱的值都不许进电流环(实测日志出现过
        Iqref=-637.50 的一瞬间 ⇒ 电流环立刻饱和、相电流冲到 9.5A 过流跳闸) */
     if (!(iq_target >= -POS_IQ_CAP_A && iq_target <= POS_IQ_CAP_A)) {
@@ -3025,7 +3030,7 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
         if (cyc > s_law_cyc_max) { s_law_cyc_max = cyc; }
     }
 
-    /* ???? */
+    /* 出到功率级(电流环 → SVPWM → TIM1) */
     FOC_UpdateCurrent(foc);
 }
 
@@ -3501,7 +3506,7 @@ void FOC_Control_StartPwmSmokeTest(FOC_Control_t *foc)
     LOGD("[OL] PWM smoke test: du=dv=dw=0.5 (v=0) until 't'. MOTOR WIRES DISCONNECTED?\r\n");
 }
 
-/* ---- ???? ---- */
+/* ---- 角度更新: 调观测器算出本拍的电角度与转速 ---- */
 static void FOC_UpdateAngle(FOC_Control_t *foc, float *erpm_out)
 {
     float erpm;
@@ -3519,7 +3524,7 @@ static void FOC_UpdateAngle(FOC_Control_t *foc, float *erpm_out)
     if (erpm_out != NULL) *erpm_out = erpm;
 }
 
-/* ---- ????? + SVPWM?? ---- */
+/* ---- 电流环 + SVPWM 输出(每拍跑, 20kHz) ---- */
 /* ---- ★ 2026-10-24 到位静音判定(见 PWM_IDLE_OFF_* 的说明) ----
    返回 1 = 当前处于"已关断"。
    抽成函数的两个目的:
@@ -3586,11 +3591,11 @@ static void FOC_UpdateCurrent(FOC_Control_t *foc)
         }
     }
 
-    /* Clarke?? */
+    /* Clarke 变换: 三相 → α/β */
     Clarke_Transform(foc->current.u, foc->current.v, foc->current.w,
                      &ialpha, &ibeta);
 
-    /* Park?? */
+    /* Park 变换: α/β + 电角度 → d/q */
     Park_Transform(ialpha, ibeta, foc->angle.theta, &id, &iq);
 
     /* 方向修正放在指令侧(torque_dir×iq_ref), 反馈保持正常负反馈,
@@ -3611,13 +3616,13 @@ static void FOC_UpdateCurrent(FOC_Control_t *foc)
         foc->current_loop.iq_ref = saved;
     }
 
-    /* ?Park?? */
+    /* 逆 Park 变换: d/q → α/β */
     InvPark_Transform(CurrentLoop_GetVd(&foc->current_loop),
                       CurrentLoop_GetVq(&foc->current_loop),
                       foc->angle.theta,
                       &valpha, &vbeta);
 
-    /* SVPWM?? */
+    /* SVPWM: α/β → 三相占空比(含零序注入与死区补偿) */
     PWM_Output_SVPWM(&foc->pwm, valpha, vbeta,
                      foc->current.u, foc->current.v, foc->current.w);
 
@@ -3636,7 +3641,7 @@ static void FOC_UpdateCurrent(FOC_Control_t *foc)
                 &s_cur_cyc_sum, &s_cur_cyc_max, &s_cur_cyc_cnt);
 }
 
-/* ---- ???? ---- */
+/* ---- 状态机: 切状态(会先干净地停掉正在跑的开环自检) ---- */
 void FOC_Control_SetState(FOC_Control_t *foc, FOC_State_t state)
 {
     if (foc->flags.fault) return;

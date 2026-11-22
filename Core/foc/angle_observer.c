@@ -5,35 +5,41 @@
 #include "angle_observer.h"
 #include <math.h>
 
-/* ---- ??????? (???,?????) ---- */
+/* ---- 扇区中心角(电角度 rad, h1~h6; 实测标定值) ----
+   ⚠ 这张表和 SECTOR_HALFWIDTH 是"实测标定"结果, 不是理论的 60° 均分。
+      改霍尔接线 / 换电机后必须重新标定, 否则位置读数与电流矢量会整体偏移。 */
 static const float SECTOR_CENTER[8] = {
-    0.0f,           // 0 ??
+    0.0f,           // 0 非法扇区(未用)
     4.79092880f,    // h1 274.500�
     2.72533163f,    // h2 156.150�
     3.73267749f,    // h3 213.867�
     0.54017940f,    // h4  30.950�
     5.80321976f,    // h5 332.500�
     1.66184434f,    // h6  95.217�
-    0.0f            // 7 ??
+    0.0f            // 7 非法扇区(未用)
 };
 
-/* ---- ?????? (??) ---- */
+/* ---- 扇区半宽(rad) ----
+   adv(扇区内进角)的钓位就是 ±本扇区半宽 ⇒ 每格宽度不一样, 必须逐格给。 */
 static const float SECTOR_HALFWIDTH[8] = {
-    0.52359878f,    // 0 ??,??????
+    0.52359878f,    // 0 非法, 取 30° 兜底
     0.53290720f,    // h1 30.533�
     0.48200176f,    // h2 27.617�
     0.52534410f,    // h3 30.100�
     0.54017940f,    // h4 30.950�
     0.47938377f,    // h5 27.467�
     0.58148553f,    // h6 33.317�
-    0.52359878f     // 7 ??,??????
+    0.52359878f     // 7 非法, 取 30° 兜底
 };
 
-/* ---- ??/????? ---- */
+/* ---- 正/反方向的相邻扇区表 ----
+   FWD_NEXT[prev] = 正转时的下一个扇区; BWD_NEXT[prev] = 反转时的下一个。
+   用来判"这次跳变是相邻的(可信) 还是跨格的(丢步/噪声)"; 索引 0/7 为非法态。 */
 static const uint8_t FWD_NEXT[8] = { 0, 3, 6, 2, 5, 1, 4, 0 };
 static const uint8_t BWD_NEXT[8] = { 0, 5, 3, 1, 6, 4, 2, 0 };
 
-/* ---- ??????(??????) ---- */
+/* ---- 取扇区中心角(rad); dir_rev=1 时做镜像 ----
+   镜像公式 2π−a 对应"霍尔相序反接"的场合(见 board_config.h 的 CFG_HALL_DIR_REV)。 */
 static float GetSectorCenter(uint8_t state, uint8_t dir_rev)
 {
     float a = SECTOR_CENTER[state];
@@ -107,7 +113,7 @@ static uint8_t s_ent_dir   = 0xFFU;   /* 入口角缓存对应的 dir_rev */
 static float   s_ent_rad   = 0.0f;    /* 该扇区的入口边界角 */
 static float   s_ent_halfw = 0.52359878f; /* 该扇区的半宽 */
 
-/* ---- ??? ---- */
+/* ---- 初始化: 清全部观测器状态, 只留零点偏移与相序方向 ---- */
 void AngleObserver_Init(Angle_Observer_t *obs, float hall_offset_deg,
                         uint8_t hall_dir_rev)
 {
@@ -193,7 +199,9 @@ uint8_t AngleObserver_PollHall(Angle_Observer_t *obs, Hall_State_t *hall,
     return 1U;
 }
 
-/* ---- ????????? ---- */
+/* ---- 处理一条"已确认合法"的霍尔边沿 ----
+   调用方(OnHallEdge / PollHall)负责相邻性与最小间隔校验; 本函数负责
+   方向判定、测速、方向表更新, 并把 adv 重置到新扇区的入口边界。 */
 void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
                               uint32_t now_tick, float pwm_freq,
                               float min_dt_ticks, float omega_clamp_erpm,
@@ -211,7 +219,7 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
 
     prev_dir = obs->last_dir;        /* 进入本次边沿前的"上次确认方向" */
 
-    /* ---- ???? ---- */
+    /* ---- 判方向: 相邻跳变才可信; 非相邻(丢步/跨格)时沿用上次确认的方向 ---- */
     if (hall->prev_state >= 1 && hall->prev_state <= 6) {
         if (h == FWD_NEXT[hall->prev_state]) {
             dir = 1;
@@ -317,7 +325,8 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
 
     dt = now_tick - hall->edge_tick;
 
-    /* ---- ???? ---- */
+    /* ---- 防抖: 间隔短于 min_dt_ticks 视为抖动/噪声 ----
+       注意这里**只**重置 adv 与 prev_state, 不动 edge_tick(测速仍按真边沿算)。 */
     if (dt < min_dt_ticks) {
         obs->glitch_cnt++;
         obs->theta_base = GetSectorCenter(h, obs->hall_dir_rev);
@@ -375,19 +384,19 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
             /* t0==0 → 历史还没填满(刚同步/刚交接), 保留上面的单边沿估计 */
         }
 
-        /* ---- ???? ---- */
+        /* ---- 速度限幅: 物理上限, 防止把噪声/丢步当成超高转速 ---- */
         float omega_clamp = omega_clamp_erpm * 6.28318531f / 60.0f / pwm_freq;
         if (obs->omega >  omega_clamp) obs->omega =  omega_clamp;
         if (obs->omega < -omega_clamp) obs->omega = -omega_clamp;
 
-        /* ---- ?????? ---- */
+        /* ---- 角加速度: 相邻两次 omega 差分, 再低通 + 限幅 ---- */
         obs->alpha = (obs->omega - obs->omega_prev) / (float)dt;
         if (obs->alpha >  alpha_max) obs->alpha =  alpha_max;
         if (obs->alpha < -alpha_max) obs->alpha = -alpha_max;
         obs->alpha_filt = 0.5f * obs->alpha_filt + 0.5f * obs->alpha;
         obs->omega_prev = obs->omega;
 
-        /* ---- ?????? ---- */
+        /* ---- 滤波后速度 omega_filt(上报给控制环的就是它) ---- */
         /* ---- ★★ 2026-10-11j: 长时间没边沿(堵转/极慢)之后的**第一条**边沿, 不
            能用"含堵转时间段的窗口"去平均测速。
            实测(10-11i 日志): 卡在齿槽里 400ms 后一脱困, 窗口跨的那一段大部分
@@ -408,7 +417,7 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
         obs->synced = 1;
     }
 
-    /* ---- ???? ---- */
+    /* ---- 提交本次边沿: 记下状态/时刻/间隔/方向, 并把 adv 重置到入口边界 ---- */
     hall->prev_state = h;
     hall->edge_tick = now_tick;
     hall->prev_dt = dt;
@@ -421,7 +430,7 @@ void AngleObserver_OnHallEdge(Angle_Observer_t *obs, Hall_State_t *hall,
     obs->adv = -(float)dir * obs->theta_halfwidth;
 }
 
-/* ---- ?????? (?PWM????) ---- */
+/* ---- 取电角度(每个 PWM 周期调一次; 无新边沿时靠模型外推) ---- */
 /* 无新边沿时模型速度的衰减时间常数(秒): 2026-10-11h 新增, 见 GetTheta 内注释。
    ★ 2026-10-11k 0.15→0.08: 实测交接点后模型还带着 I-F 拖转的速度(189eRPM)
    继续"爬"了 9.4°机械(= 0.6 个扇区)才停, 而转子其实早就被摩擦停住了
@@ -694,7 +703,7 @@ float AngleObserver_GetTheta(Angle_Observer_t *obs, const Hall_State_t *hall,
     return theta_out;
 }
 
-/* ---- ???? (eRPM) ---- */
+/* ---- 读速度(eRPM): 未滤波 = 单边沿/窗口估计的即时值 ---- */
 float AngleObserver_GetOmegaErpm(const Angle_Observer_t *obs, float pwm_freq)
 {
     return obs->omega * pwm_freq / 6.28318531f * 60.0f;
@@ -740,7 +749,9 @@ void AngleObserver_CalibrateOffsetAtZero(Angle_Observer_t *obs, uint8_t hall_sta
     while (obs->offset < 0.0f)         obs->offset += 6.28318531f;
 }
 
-/* ---- ???? ---- */
+/* ---- 直接设霍尔零点偏移(deg) ----
+   平时由 AngleObserver_CalibrateOffsetAtZero() 在 ALIGN 结束时自动标定,
+   这个接口只在手动调试/临时修正时用。 */
 void AngleObserver_SetOffset(Angle_Observer_t *obs, float offset_deg)
 {
     obs->offset = offset_deg * 0.01745329f;
