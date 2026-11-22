@@ -35,7 +35,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-11-02 cal30 20k A2g-W2"
+#define FW_BUILD_TAG  "2026-11-22 cal30 20k A2g-T2"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U

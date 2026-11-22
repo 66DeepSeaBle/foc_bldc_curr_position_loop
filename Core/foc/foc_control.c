@@ -1064,6 +1064,32 @@ static void FOC_DoSpeedLoop(FOC_Control_t *foc, float dt_s)
    28°/s 只在最后 2/9 时间里起作用(末段少走 2°), 巡航 vc 几乎不变
    (D=360/T=0.81: vc 从 776 → 783), 所以对运动负载率/耗时无影响。 */
 #define POS_TM_VAPP_DEG_S       28.0f           /* 逼近段速度(机械°/s) */
+/* ★★★ 2026-11-22 【新】加减速段时长上限(秒)
+   ------------------------------------------------------------------
+   问题(实测): 大角度时 T 很长 —— D=7201° ⇒ T=16.2s ⇒ ta=td=3.6s。
+   转子要在低速区(齿槽“一顿一顿”的 384~681°/s 以下)慢慢爬 3.6 秒，
+   表现为“起步力矩是慢慢爬上去的、全程卡顿”。
+
+   做法: ta/td 一旦超过本值就夹住。
+   ★★ 修订(用户要求): 被砍掉的加减速时间**不再补回匀速段** ⇒
+      **总时长缩短、到点更早**，匀速段保持原来的 3/9·T 不变。
+   例: D=7201° / 名义 T=16.2s, 本值=0.5s
+        原算法: ta=3.60 tc=5.40 td=3.60 tapp=3.60  ⇒ T=16.2s, vc=789 °/s
+        现在  : ta=0.50 tc=5.40 td=0.50 tapp=3.60  ⇒ T=10.0s, vc≈1210 °/s
+   低速区停留时间从 3.6s 降到 0.5s。
+   ★ A/B 结论(2026-11-22, 实机手感):
+     0.5s = `A2g-T2` ⇒ 验收通过, **定为基线**;
+     0.8s = `A2g-T3` ⇒ 用户实测「效果没有 500ms 好」, 已回退。
+     ⇒ 起步段越短越好: 低速区(齿槽一顿一顿)的停留时间就是卡顿的直接来源,
+       不要再往 0.8~1.0s 方向调。
+
+   ⚠ 代价(必须知道): 行程 D 不变而时间变短 ⇒ **巡航速度 vc 会升高**，
+     可能超过速度档(800°/s)。日志里会打 `v_cruise OVER speed band`。
+     若实机受不了，只能靠 `t<deg> d<秒>` 把 d 给长一点。
+   ⚠ 0.0f = 关闭，完全回到原来的 2/9 : 3/9 : 2/9 : 2/9 固定比例。
+   本值只影响**定时轨迹**(数字键 / z / t<deg>)，不影响普通位置律。
+   ------------------------------------------------------------------ */
+#define POS_TM_ACC_TIME_MAX_S   0.5f
 /* ★★ 2026-10-11am 轨迹改为“**物理模型前馈 + 小权限位置微调**”，完全不用测速
    ----------------------------------------------------------------------
    实测(10-11al 日志): 把轨迹的速度环增益提到 0.03 之后, **过程大幅抖动** ——
@@ -1549,6 +1575,14 @@ static float    s_tm_deg0   = 0.0f;   /* 轨迹起点的机械角读数(°) */
 static int8_t   s_tm_sgn    = 1;
 static float    s_tm_vc     = 0.0f;   /* 巡航速度(机械°/s) */
 static float    s_tm_vapp   = 0.0f;   /* 逼近段速度(机械°/s, 2026-10-11an) */
+/* ★★ 2026-11-22: 四段时长在**武装时算一次**并固化。
+   不能再在位置律里用 `s_tm_Ttick` 反推 —— 夹位后 Ttick 是 T_eff(< 名义 T)，
+   拿它去乘 2/9、3/9 会把 tc/tapp 算小，和算 vc 时用的分段对不上 ⇒
+   轨迹走完也到不了 D。 */
+static float    s_tm_ta     = 0.0f;   /* 加速段时长(s) */
+static float    s_tm_tc     = 0.0f;   /* 匀速段时长(s) */
+static float    s_tm_td     = 0.0f;   /* 减速段时长(s) */
+static float    s_tm_tapp   = 0.0f;   /* 逼近段时长(s) */
 /* ✖✖ 2026-10-25 `A2h`（参考调速器）**实测失败，已全部回退**。
    用户评价：「效果不平滑，感觉走半圈慢一点，然后又加速，重复循环」。
    实测：`max|tv|=43.7°`（`A2g` 是 40.8°，没改善），总耗时 **12.8s / 标称 8.10s**。
@@ -1707,6 +1741,35 @@ static float TM_Profile4(float t, float ta, float tc, float td, float tapp,
         p = p3 + vapp * tapp * 0.5f;
     }
     return p;
+}
+
+/* ---- 4 段时长分配(★ 唯一真源) ----
+   SetTimedTarget(武装+算 vc) 与位置律(逐拍算参考) **必须用同一份**，
+   否则“t>ta”的判据和轨迹曲线会打架。
+   原比例: 2/9 · 3/9 · 2/9 · 2/9。
+   ★ 2026-11-22: 加减速段超过 POS_TM_ACC_TIME_MAX_S 时夹住；
+     **匀速段 tc 保持 3/9·T 不变（不补回）** ⇒ 实际总时长变短。
+   返回: 有效总时长 Teff = ta+tc+td+tapp (≤ 入参 T)。
+         ★ 调用方必须拿它去算 s_tm_Ttick，否则段号/结束判据会不同步。 */
+static float TM_SegTimes(float T, float *ta, float *tc, float *td, float *tapp)
+{
+    float a = T * POS_TM_TA_FRAC;
+    float d = T * POS_TM_TD_FRAC;
+    float c = T * POS_TM_TC_FRAC;                                             /* 匀速段不变量 */
+    float p = T * (1.0f - POS_TM_TA_FRAC - POS_TM_TC_FRAC - POS_TM_TD_FRAC);
+
+    /* ⚠ 这里**不能**用 #if: 预处理表达式里不能出现浮点常量。
+       用普通 if 即可 —— 全是编译期常量, -O3 会直接折叠掉。 */
+    if (POS_TM_ACC_TIME_MAX_S > 0.0f) {
+        if (a > POS_TM_ACC_TIME_MAX_S) a = POS_TM_ACC_TIME_MAX_S;
+        if (d > POS_TM_ACC_TIME_MAX_S) d = POS_TM_ACC_TIME_MAX_S;
+    }
+
+    *ta = a;
+    *tc = c;
+    *td = d;
+    *tapp = p;
+    return a + c + d + p;
 }
 
 /* ==========================================================================
@@ -2159,10 +2222,11 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
             if (s_tm_t0 == 0U) s_tm_t0 = foc->tick;
             t  = (float)(foc->tick - s_tm_t0) / (float)FOC_CTRL_HZ;
             Tm = (float)s_tm_Ttick / (float)FOC_CTRL_HZ;
-            ta   = Tm * POS_TM_TA_FRAC;
-            tc   = Tm * POS_TM_TC_FRAC;
-            td   = Tm * POS_TM_TD_FRAC;
-            tapp = Tm - ta - tc - td;
+            /* ★ 用武装时固化的分段(夹位后 tc/tapp 不一定是 Tm 的 3/9、2/9) */
+            ta   = s_tm_ta;
+            tc   = s_tm_tc;
+            td   = s_tm_td;
+            tapp = s_tm_tapp;
             if (t < ta) {
                 s_tm_phase = 1U;
             } else if (t < (ta + tc)) {
@@ -2396,11 +2460,13 @@ static void FOC_DoPositionLoop(FOC_Control_t *foc, float dt_s)
                 if (s_tm_active) {
                     float t   = (float)(foc->tick - s_tm_t0) / (float)FOC_CTRL_HZ;
                     float Tm  = (float)s_tm_Ttick / (float)FOC_CTRL_HZ;
-                    float ta  = Tm * POS_TM_TA_FRAC;
-                    float tc  = Tm * POS_TM_TC_FRAC;
-                    float td  = Tm * POS_TM_TD_FRAC;
-                    float tapp = Tm - ta - tc - td;
+                    float ta, tc, td, tapp;
                     float vp  = 0.0f;
+                    /* ★ 用武装时固化的分段(与算 vc 时完全一致) */
+                    ta   = s_tm_ta;
+                    tc   = s_tm_tc;
+                    td   = s_tm_td;
+                    tapp = s_tm_tapp;
                     float p   = TM_Profile4(t, ta, tc, td, tapp,
                                             s_tm_vc, s_tm_vapp, &vp);
                     float ref = s_tm_deg0 + (float)s_tm_sgn * p;
@@ -3723,6 +3789,10 @@ void FOC_Control_SetPosTarget(FOC_Control_t *foc, float target_deg)
 void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_s)
 {
     float pos0, dist, D, T, Tmin_a, Tmin_v;
+    float T_eff;                     /* ★ 夹位后的实际总时长(≤ T) */
+    float ta, tc, td, tapp;          /* ★ 4 段时长(唯一真源见 TM_SegTimes) */
+    uint8_t acc_capped;              /* 1 = 本次触发了加减速时长上限(日志用) */
+    const char *tm_tag;              /* [TM] 行尾标记 */
 
     FOC_Control_SetPosTarget(foc, target_deg);   /* 先走普通换目标(复位一切) */
     if (!(dur_s > 0.0f)) {
@@ -3751,7 +3821,6 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
         T = dur_s;
     }
     s_tm_t0     = 0U;        /* 0 = 还没起步(第一拍位置环里锚定时间轴) */
-    s_tm_Ttick  = (uint32_t)(T * (float)FOC_CTRL_HZ + 0.5f);
     s_tm_deg0   = pos0;
     s_tm_sgn    = (dist >= 0.0f) ? 1 : -1;
     /* ★ 2026-10-11an 4 段: 加速 2/9 + 匀速 3/9 + 减速 2/9 + 逼近 2/9。
@@ -3762,17 +3831,23 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
        即轨迹自己会多冲 8°。现在改成“短行程时按比例降 vapp”, 两边同时缩,
        保证总行程严格等于 D。 (vc=vapp 时的最小行程 = vapp×1.333s) */
     {
-        float ta = T * POS_TM_TA_FRAC;
-        float tc = T * POS_TM_TC_FRAC;
-        float td = T * POS_TM_TD_FRAC;
-        float tapp = T - ta - tc - td;
-        float den  = ta * 0.5f + tc + td * 0.5f;
+        float den, dmin_k, vapp, vc;
+
+        /* ★ 2026-11-22: 加减速段超过 POS_TM_ACC_TIME_MAX_S 就夹住，
+           ★★ 被砍掉的时间**不补回匀速段** ⇒ 实际总时长 T_eff 小于名义 T。 */
+        T_eff = TM_SegTimes(T, &ta, &tc, &td, &tapp);
+        s_tm_ta   = ta;      /* ★ 固化下来, 位置律逐拍直接用 */
+        s_tm_tc   = tc;
+        s_tm_td   = td;
+        s_tm_tapp = tapp;
+        acc_capped = ((POS_TM_ACC_TIME_MAX_S > 0.0f) &&
+                      ((T * POS_TM_TA_FRAC) > (POS_TM_ACC_TIME_MAX_S + 1.0e-4f))) ? 1U : 0U;
+        den = ta * 0.5f + tc + td * 0.5f;
         /* ★ cal19 同理: 逼近段改为 vapp 线性减到 0, 其平均速度是 vapp/2 ⇒
            总行程里的 vapp 系数从 (td/2 + tapp) 变成 (td/2 + tapp/2)。
            dmin_k(= vc=vapp 时的最小行程 / vapp) = ta/2 + tc + td + tapp/2。 */
-        float dmin_k = ta * 0.5f + tc + td + tapp * 0.5f;
-        float vapp = POS_TM_VAPP_DEG_S;
-        float vc;
+        dmin_k = ta * 0.5f + tc + td + tapp * 0.5f;
+        vapp   = POS_TM_VAPP_DEG_S;
 
         if (D < vapp * dmin_k) {
             vapp = D / dmin_k;                          /* 短行程: 等比例降逼近速度 */
@@ -3783,6 +3858,9 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
         s_tm_vapp = vapp;
         s_tm_vc   = vc;
     }
+    /* ★★ 2026-11-22: 夹位后总时长变短 ⇒ Ttick 必须用 T_eff,
+       否则段号推进/结束判据会按名义 T 跑, 和轨迹曲线对不上。 */
+    s_tm_Ttick  = (uint32_t)(T_eff * (float)FOC_CTRL_HZ + 0.5f);
     s_tm_phase  = 1U;
     s_tm_active = 1U;
     s_tm_iq           = 0.0f;   /* 2026-10-11am 模型前馈状态复位 */
@@ -3800,10 +3878,16 @@ void FOC_Control_SetTimedTarget(FOC_Control_t *foc, float target_deg, float dur_
 #if POS_TRIM_SLEW_EN
     s_tm_trim_out    = 0.0f;   /* ★ B1: slew 状态随轨迹复位 */
 #endif
-    LOGD("[TM] %.1f -> %.1fdeg (D=%.1f) in %.2fs | accel %.2fs + cruise %.2fs + decel %.2fs + creep %.2fs | v_cruise=%.1f -> v_app=%.1f deg/s\r\n",
-         pos0, foc->pos_target_deg_cmd, D, T,
-         T * POS_TM_TA_FRAC, T * POS_TM_TC_FRAC, T * POS_TM_TD_FRAC,
-         T * (1.0f - POS_TM_TA_FRAC - POS_TM_TC_FRAC - POS_TM_TD_FRAC),
+    tm_tag = "";
+    if (acc_capped != 0U) {
+        tm_tag = (s_tm_vc > POS_TM_VMAX_MECH_DEG_S)
+                     ? "  <== accel/decel capped; v_cruise OVER speed band"
+                     : "  <== accel/decel capped";
+    }
+    LOGD("[TM] %.1f -> %.1fdeg (D=%.1f) in %.2fs | accel %.2fs + cruise %.2fs + decel %.2fs + creep %.2fs%s | v_cruise=%.1f -> v_app=%.1f deg/s\r\n",
+         pos0, foc->pos_target_deg_cmd, D, T_eff,
+         ta, tc, td, tapp,
+         tm_tag,
          s_tm_vc, s_tm_vapp);
     /* ★ 2026-10-25 大角度排障: 把武装结果也打出来。
        如果发了命令却不动, 看这一行就知道是"没武装"还是"武装了但没跑"。 */
