@@ -35,7 +35,7 @@
 
 /* 固件版本标签: 开机打一次, 并跟着 [ADCR] 每秒打一次 —— 只截日志中段也能确认
    跑的是哪一版(反复吃过"烧的不是当前源码"的亏)。 */
-#define FW_BUILD_TAG  "2026-10-25 cal30 20k A2g"
+#define FW_BUILD_TAG  "2026-11-02 cal30 20k A2g-W2"
 
 /* 零电流标定采样点数 */
 #define APP_CAL_SAMPLES   128U
@@ -853,16 +853,87 @@ void App_OnCurrentSample(void)
     }
 }
 
-/* 1kHz: VOFA 波形一帧(通道: Iu, Iv, Iw, Spd(°/s), Pos(°)) */
+/* ==========================================================================
+ * VOFA 显示用一阶低通 —— ★ 只影响波形, 不参与控制 ★
+ *
+ * 为什么加:
+ *   送出去的是 20kHz 控制环里的**瞬时值**, 而 ADC 每个 PWM 周期只在
+ *   CCR4=98.85%*ARR 这一固定相位采一次, 采到的是相电流纹波的某个瞬时点,
+ *   不是平均电流。本机 L=0.31mH / 23.8V / 20kHz 下纹波
+ *       ΔIpp ≈ Vdc*D(1-D)*T/L ≈ 0.96A  (±0.5A)
+ *   ⇒ 画出来就是 ±0.3~0.5A 的一层毛刺。
+ *
+ * τ 取 2ms (转折 79.6Hz) 的取舍:
+ *   · 500Hz 处衰减 6.4 倍, 1kHz(Nyquist) 处衰减 12.6 倍 ⇒ 吃掉纹波/采样毛刺
+ *   · 10Hz 附近几乎不衰减 ⇒ **不会掩盖 trim 的 ±1.5A 摆动**
+ *   这样两层(纹波 vs 位置台阶引起的指令尖峰)仍然能分开看。
+ *   想恢复原样(直送瞬时值): 把 VOFA_LPF_TAU_MS 改成 0.0f。
+ * ========================================================================== */
+#define VOFA_LPF_TAU_MS   2.0f      /* 0.0f = 关闭滤波; 5.0f = 更平滑但拖尾 */
+#define VOFA_TICK_MS      1.0f      /* TIM6 节拍 = 1kHz */
+
+/* ★ 2026-11-02 A2g-W2: 改成"诊断帧"(默认)。
+ *
+ * 为什么改 —— A2g-W1 加了 τ=2ms 低通, 实测波形**一点没变**。原因很清楚:
+ *   τ=2ms 的转折是 79.6Hz, 只能砍 ≥500Hz 的东西; 而日志里的尖峰是
+ *   **2.5~5Hz、±1.2~1.5A 的真实电流**(见 [MAIN] 的 tr=Iqref+0.35, tr≈0.04*tv),
+ *   正好落在通带里 ⇒ 滤波器按设计就碰不到它。
+ *
+ * 所以这一版不再猜, 而是把四个关键量摆到同一帧上, 一眼分开:
+ *   ch1 = Iu 原始(20kHz 瞬时值, 不滤波)
+ *   ch2 = Iu 一阶低通(τ=2ms)
+ *        ⇒ ch1 与 ch2 **重合** = 尖峰是真电流; ch2 明显更平 = 尖峰是噪声
+ *   ch3 = Iqref 实际施加值(A)
+ *        ⇒ 尖峰在这里也出现 ⇒ 是控制指令在跳, 与采样无关
+ *   ch4 = vsp 位置环速度(机械 °/s)
+ *        ⇒ 塌到 0 的时刻就是 trim 顶起来的时刻
+ *   ch5 = Pos 机械角度(°)
+ *
+ * 要回到"三相电流 + 速度 + 位置"的老帧: 把 VOFA_FRAME_DIAG 改成 0。
+ * ========================================================================== */
+#define VOFA_FRAME_DIAG   1         /* 1 = 诊断帧(推荐); 0 = 老的三相电流帧 */
+
+/* 1kHz: VOFA 波形一帧 */
 void App_OnWaveTick(void)
 {
-    if (VOFA_GetEnable()) {
-        /* ★ 速度: FOC_Control_GetPosErpm() 是 eRPM; 本机 4 对极 ⇒
-           1 eRPM = 360°/60s/pp = 1.5 机械°/s, 所以 ×1.5 就是 °/s。
-           想改看 Iq/Iqref 就把下面任一个换掉(它们才是能看出控制动作的量)。 */
-        VOFA_Send5(g_foc.current.u, g_foc.current.v, g_foc.current.w,
+    static float   s_viu = 0.0f;
+    static uint8_t s_vfirst = 1U;
+
+    if (VOFA_GetEnable() == 0U) {
+        s_vfirst = 1U;      /* 关掉再打开时从当前值重新起步, 不从旧值拖尾 */
+        return;
+    }
+
+    {
+        float iu = g_foc.current.u;
+        float iv = g_foc.current.v;
+        float iw = g_foc.current.w;
+
+        /* U 相一阶低通(只用来看 ch1 与 ch2 的差, 不参与任何控制) */
+        if (s_vfirst != 0U) {
+            s_viu = iu;     /* 首帧直接对齐, 避免从上电的 0 慢慢爬上来 */
+            s_vfirst = 0U;
+        } else if (VOFA_LPF_TAU_MS > 0.0f) {
+            const float a = VOFA_TICK_MS / (VOFA_LPF_TAU_MS + VOFA_TICK_MS);
+            s_viu += (iu - s_viu) * a;
+        } else {
+            s_viu = iu;     /* 滤波关闭: 直送瞬时值 */
+        }
+
+#if (VOFA_FRAME_DIAG != 0)
+        (void)iv;
+        (void)iw;
+        VOFA_Send5(iu,                                   /* ch1 原始  */
+                   s_viu,                                /* ch2 滤波  */
+                   g_foc.current_loop.iq_ref * (float)g_foc.torque_dir, /* ch3 指令 */
+                   FOC_Control_GetPosErpm() * 1.5f,      /* ch4 vsp   */
+                   g_sensor.GetMechDeg(&g_foc));         /* ch5 Pos   */
+#else
+        (void)s_viu;
+        VOFA_Send5(iu, iv, iw,
                    FOC_Control_GetPosErpm() * 1.5f,
                    g_sensor.GetMechDeg(&g_foc));
+#endif
     }
 }
 
