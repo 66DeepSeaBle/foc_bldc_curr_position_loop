@@ -116,6 +116,8 @@
 | `Core/bsp/adc.c` `tim.c` `gpio.c` `opamp.c` `usart.c` | 287/346/70/195/144 | 平台 | CubeMX 生成 + 手改的 `USER CODE` 段 |
 | `Core/Inc/log.h` | 64 | 基础设施 | `LOGI/D/W/E` 分级宏, 统一走 `LOG_Printf` |
 | `Core/foc/FOC_APP_API.md` | — | 文档 | **上层调用接口**（力矩档/速度档/MoveTo），与本文互补 |
+| `docs/CONTROL_COMMANDS.md` | — | 文档 | **调试控制命令手册**（按键、移动命令、档位、自检、日志读法） |
+| `docs/ARCHITECTURE.md` | — | 文档 | 本文 |
 
 ---
 
@@ -415,6 +417,9 @@ extern const Sensor_Driver_t g_sensor;   /* 由 CFG_SENSOR_TYPE 编译期二选�
 
 ## 10. 日志与波形
 
+> 完整按键表、`t<deg> d<sec>` 语法、档位派生限幅、自检流程、字段速查，
+> 见配套文档 **[`docs/CONTROL_COMMANDS.md`](CONTROL_COMMANDS.md)**。
+
 ### 10.1 日志分级与节流
 
 | 标签 | 周期 | 内容 |
@@ -467,6 +472,7 @@ idle=43%                                       ← CPU 空闲
 8. `angle_observer.c`（700 行，**最后看**，它最复杂且被大量实机教训注释包裹）
 9. `foc_control.c` 的位置律部分（`POS_TM_*` 宏区 + `FOC_DoPositionLoop`）
 10. `FOC_APP_API.md`（上层调用接口）
+11. `docs/CONTROL_COMMANDS.md`（调试命令手册，实际动手时对着看）
 
 ---
 
